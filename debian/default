@@ -1,0 +1,7 @@
+# Environment for backscale.service.
+
+#RUST_LOG=info
+
+# For an identity key on a YubiKey: the daemon re-signs its device binding
+# every 12 hours and needs the card PIN without a terminal.
+#BACKSCALE_PIN_FILE=/etc/backscale/pin
