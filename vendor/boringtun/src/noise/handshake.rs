@@ -7,13 +7,14 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
-use aead::{Aead, Payload};
+use aead::generic_array::GenericArray;
+use aead::{Aead, AeadInPlace, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::{ChaCha20Poly1305, Key, XChaCha20Poly1305};
 use rand_core::OsRng;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
+use subtle::ConstantTimeEq;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "mock-instant")]
@@ -103,14 +104,14 @@ fn aead_chacha20_seal_inner(
     data: &[u8],
     aad: &[u8],
 ) {
-    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
+    let key = ChaCha20Poly1305::new(Key::from_slice(key));
 
     ciphertext[..data.len()].copy_from_slice(data);
 
     let tag = key
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad),
+        .encrypt_in_place_detached(
+            GenericArray::from_slice(&nonce),
+            aad,
             &mut ciphertext[..data.len()],
         )
         .unwrap();
@@ -142,18 +143,21 @@ fn aead_chacha20_open_inner(
     nonce: [u8; 12],
     data: &[u8],
     aad: &[u8],
-) -> Result<(), ring::error::Unspecified> {
-    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
+) -> Result<(), aead::Error> {
+    let key = ChaCha20Poly1305::new(Key::from_slice(key));
 
-    let mut inner_buffer = data.to_owned();
+    let pt_len = data.len().checked_sub(16).ok_or(aead::Error)?;
+    let (ct, tag) = data.split_at(pt_len);
+    let mut inner_buffer = ct.to_owned();
 
-    let plaintext = key.open_in_place(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(aad),
+    key.decrypt_in_place_detached(
+        GenericArray::from_slice(&nonce),
+        aad,
         &mut inner_buffer,
+        GenericArray::from_slice(tag),
     )?;
 
-    buffer.copy_from_slice(plaintext);
+    buffer.copy_from_slice(&inner_buffer);
 
     Ok(())
 }
@@ -521,11 +525,14 @@ impl Handshake {
             &hash,
         )?;
 
-        ring::constant_time::verify_slices_are_equal(
-            self.params.peer_static_public.as_bytes(),
-            &peer_static_public_decrypted,
-        )
-        .map_err(|_| WireGuardError::WrongKey)?;
+        if !bool::from(
+            self.params
+                .peer_static_public
+                .as_bytes()
+                .ct_eq(&peer_static_public_decrypted),
+        ) {
+            return Err(WireGuardError::WrongKey);
+        }
 
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, packet.encrypted_static);

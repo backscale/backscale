@@ -15,7 +15,15 @@ use aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
-use ring::constant_time::verify_slices_are_equal;
+use subtle::ConstantTimeEq;
+
+fn verify_slices_are_equal(a: &[u8], b: &[u8]) -> Result<(), ()> {
+    if bool::from(a.ct_eq(b)) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;

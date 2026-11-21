@@ -5,13 +5,15 @@ use super::PacketData;
 use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use aead::generic_array::GenericArray;
+use aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key};
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    receiver: LessSafeKey,
-    sender: LessSafeKey,
+    receiver: ChaCha20Poly1305,
+    sender: ChaCha20Poly1305,
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
 }
@@ -161,10 +163,8 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            receiver: ChaCha20Poly1305::new(Key::from_slice(&receiving_key)),
+            sender: ChaCha20Poly1305::new(Key::from_slice(&sending_key)),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
         }
@@ -214,9 +214,9 @@ impl Session {
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
             self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
+                .encrypt_in_place_detached(
+                    GenericArray::from_slice(&nonce),
+                    &[],
                     &mut data[..src.len()],
                 )
                 .map(|tag| {
@@ -252,14 +252,20 @@ impl Session {
         let ret = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            let pt_len = ct_len
+                .checked_sub(AEAD_SIZE)
+                .ok_or(WireGuardError::InvalidAeadTag)?;
+            let (ct, tag) = packet.encrypted_encapsulated_packet.split_at(pt_len);
+            dst[..pt_len].copy_from_slice(ct);
             self.receiver
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut dst[..ct_len],
+                .decrypt_in_place_detached(
+                    GenericArray::from_slice(&nonce),
+                    &[],
+                    &mut dst[..pt_len],
+                    GenericArray::from_slice(tag),
                 )
-                .map_err(|_| WireGuardError::InvalidAeadTag)?
+                .map_err(|_| WireGuardError::InvalidAeadTag)?;
+            &mut dst[..pt_len]
         };
 
         // After decryption is done, check counter again, and mark as received
