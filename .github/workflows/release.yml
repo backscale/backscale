@@ -39,11 +39,24 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb
-      - run: scripts/build-static.sh ${{ matrix.target }}
+      - name: Build static binary and .deb
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          cargo build --release --target "$TARGET" --features hardware --bin backscale
+          bin=target/$TARGET/release/backscale
+          if ! file -b "$bin" | grep -qE "static(-pie)? linked|statically linked"; then
+            echo "$bin is not statically linked: $(file -b "$bin")" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$bin" "dist/backscale-$TARGET"
+          cargo deb --target "$TARGET" --no-build --no-strip --output dist/
       - uses: actions/upload-artifact@v7
         with:
           name: backscale-${{ github.ref_name }}-${{ matrix.target }}
-          path: target/static/*
+          path: dist/*
           if-no-files-found: error
 
   release:
