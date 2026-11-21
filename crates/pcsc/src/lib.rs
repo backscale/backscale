@@ -388,7 +388,13 @@ impl Context {
         let mut field = [0u8; MAX_READERNAME];
         field[..name.len()].copy_from_slice(name);
         body.extend_from_slice(&field);
-        body.extend(words(&[share_mode as u32, preferred_protocols.0 as u32, 0, 0, 0]));
+        body.extend(words(&[
+            share_mode as u32,
+            preferred_protocols.0 as u32,
+            0,
+            0,
+            0,
+        ]));
         let r = self.conn.with(|s| exchange(s, CONNECT, &body))?;
         let fields = &r[4 + MAX_READERNAME..];
         check(word(fields, 4))?;

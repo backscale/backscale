@@ -33,7 +33,11 @@ fn fake_pcscd(name: &str, readers: &'static [&'static str]) -> (PathBuf, JoinHan
                     let mut states = vec![0u8; MAX_READERS * READER_STATE_LEN];
                     for (i, r) in readers.iter().enumerate() {
                         // Leave slot 1 empty, as after an unplug.
-                        let at = if i == 0 { 0 } else { (i + 1) * READER_STATE_LEN };
+                        let at = if i == 0 {
+                            0
+                        } else {
+                            (i + 1) * READER_STATE_LEN
+                        };
                         states[at..at + r.len()].copy_from_slice(r.as_bytes());
                     }
                     states
@@ -53,7 +57,11 @@ fn fake_pcscd(name: &str, readers: &'static [&'static str]) -> (PathBuf, JoinHan
                 }
                 BEGIN_TRANSACTION => {
                     begins += 1;
-                    let rv = if begins == 1 { SHARING_VIOLATION } else { SUCCESS };
+                    let rv = if begins == 1 {
+                        SHARING_VIOLATION
+                    } else {
+                        SUCCESS
+                    };
                     words(&[word(&b, 0), rv])
                 }
                 TRANSMIT => {
@@ -112,10 +120,13 @@ fn session_against_fake_pcscd() {
     assert_eq!(names[1].to_bytes(), EMPTY_READER.as_bytes());
 
     assert_eq!(
-        ctx.connect(names[1], ShareMode::Shared, Protocols::ANY).err(),
+        ctx.connect(names[1], ShareMode::Shared, Protocols::ANY)
+            .err(),
         Some(Error::NoSmartcard)
     );
-    let mut card = ctx.connect(names[0], ShareMode::Shared, Protocols::T1).unwrap();
+    let mut card = ctx
+        .connect(names[0], ShareMode::Shared, Protocols::T1)
+        .unwrap();
     {
         let tx = card.transaction().unwrap();
         let mut resp = [0u8; 16];
@@ -134,7 +145,9 @@ fn session_against_fake_pcscd() {
             &[1, 2, 3]
         );
     }
-    card.disconnect(Disposition::LeaveCard).map_err(|(_, e)| e).unwrap();
+    card.disconnect(Disposition::LeaveCard)
+        .map_err(|(_, e)| e)
+        .unwrap();
     drop(ctx);
 
     let log = server.join().unwrap();
