@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 atomic-write-file = "0.3.1"
-blake3 = "1.8.7"
+blake3 = { version = "1.8.7", features = ["pure"] }
 boringtun = { version = "0.7.1", default-features = false }
 bt_bencode = "0.8.2"
 card-backend = { version = "0.2", optional = true }
@@ -32,7 +32,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.19"
 sha1 = "0.11.0"
 sha2 = "0.11"
-snow = "0.10.0"
+# Not the defaults: snow's `std` feature pulls in ring.
+snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 socket2 = "0.6.5"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
 toml = "1.2.1"
@@ -48,6 +49,10 @@ zeroize = "1.9.2"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
 
+
+[patch.crates-io]
+# git subtree of cloudflare/boringtun 0.7.1 with ring replaced by RustCrypto.
+boringtun = { path = "vendor/boringtun" }
 
 [features]
 default = []
