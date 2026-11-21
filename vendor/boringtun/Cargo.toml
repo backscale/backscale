@@ -67,7 +67,8 @@ dead_code = "allow"
 mismatched_lifetime_syntaxes = "allow"
 
 [lib]
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Only used as a Rust dependency; the C library builds aren't needed.
+crate-type = ["rlib"]
 
 [[bench]]
 name = "crypto_benches"
