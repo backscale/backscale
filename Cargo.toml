@@ -50,9 +50,15 @@ tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
 
 
+[workspace]
+members = ["crates/pcsc"]
+exclude = ["vendor/boringtun"]
+
 [patch.crates-io]
 # git subtree of cloudflare/boringtun 0.7.1 with ring replaced by RustCrypto.
 boringtun = { path = "vendor/boringtun" }
+# Talks to pcscd directly instead of linking libpcsclite.
+pcsc = { path = "crates/pcsc" }
 
 [features]
 default = []

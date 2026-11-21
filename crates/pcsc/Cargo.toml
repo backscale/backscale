@@ -1,0 +1,11 @@
+[package]
+# Named and versioned as the crates.io `pcsc` crate so [patch.crates-io] can
+# substitute it for yubikey and card-backend-pcsc.
+name = "pcsc"
+version = "2.9.0"
+edition = "2024"
+description = "Pure-Rust PC/SC client that talks to pcscd directly, without libpcsclite"
+license = "MIT"
+publish = false
+
+[dependencies]
