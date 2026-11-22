@@ -116,7 +116,7 @@ pub struct Endpoint {
 
 pub struct UdpMux {
     pub local_addr: SocketAddr,
-    pub dht: Endpoint,
+    pub dht: backscale_dht::Transport,
     pub utp: backscale_utp::Transport,
     pub wg: Endpoint,
     pub tasks: MuxTasks,
@@ -188,9 +188,9 @@ impl UdpMux {
 
         Ok(UdpMux {
             local_addr,
-            dht: Endpoint {
+            dht: backscale_dht::Transport {
                 rx: dht_rx,
-                tx: PacketTx::new(out_tx.clone()),
+                tx: out_tx.clone(),
             },
             utp: backscale_utp::Transport {
                 rx: utp_rx,
@@ -240,13 +240,16 @@ mod tests {
         let mut a = UdpMux::bind(any6).await.unwrap();
         let port = a.local_addr.port();
         let mut b4 = UdpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        b4.dht.tx.send(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-            b"d1:xi4ee".to_vec(),
-        );
+        b4.dht
+            .tx
+            .try_send((
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                b"d1:xi4ee".to_vec(),
+            ))
+            .unwrap();
         let (from, _) = a.dht.rx.recv().await.unwrap();
         assert_eq!(from, b4.local_addr, "IPv4 peer must appear as plain IPv4");
-        a.dht.tx.send(from, b"d1:xi5ee".to_vec());
+        a.dht.tx.try_send((from, b"d1:xi5ee".to_vec())).unwrap();
         assert_eq!(b4.dht.rx.recv().await.unwrap().1, b"d1:xi5ee");
 
         let Ok(mut b6) = UdpMux::bind("[::1]:0".parse().unwrap()).await else {
@@ -273,12 +276,15 @@ mod tests {
         let utp = vec![0x01, 0, 0x12, 0x34];
         let wg = vec![0x01, 0, 0, 0, 9];
         a.utp.tx.try_send((b.local_addr, utp.clone())).unwrap();
-        a.dht.tx.send(b.local_addr, b"de".to_vec());
+        a.dht.tx.try_send((b.local_addr, b"de".to_vec())).unwrap();
         a.wg.tx.send(b.local_addr, wg.clone());
         assert_eq!(b.utp.rx.recv().await.unwrap(), (a.local_addr, utp));
         assert_eq!(b.dht.rx.recv().await.unwrap().1, b"de");
         assert_eq!(b.wg.rx.recv().await.unwrap().1, wg);
-        b.dht.tx.send(a.local_addr, b"d1:xi1ee".to_vec());
+        b.dht
+            .tx
+            .try_send((a.local_addr, b"d1:xi1ee".to_vec()))
+            .unwrap();
         assert_eq!(a.dht.rx.recv().await.unwrap().1, b"d1:xi1ee");
     }
 }

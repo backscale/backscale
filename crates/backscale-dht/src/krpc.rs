@@ -5,15 +5,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use rootcause::prelude::*;
 use serde_bytes::ByteBuf;
 use tokio::sync::oneshot;
+use tracing::trace;
 
 use super::node_id::NodeId;
 use super::wire::{Args, CompactAddr, Message, Resp};
-use crate::net::socket::PacketTx;
+use crate::PacketTx;
 
-pub const CLIENT_VERSION: &[u8] = b"BK\x00\x01";
 const MAX_PENDING: usize = 4096;
 
 pub const PING: &[u8] = b"ping";
@@ -58,6 +57,7 @@ pub struct Rpc {
     pending: Mutex<HashMap<[u8; 2], Pending>>,
     next_tid: AtomicU16,
     timeout: Duration,
+    version: Option<ByteBuf>,
 }
 
 struct PendingGuard<'a> {
@@ -72,12 +72,13 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Rpc {
-    pub fn new(tx: PacketTx, timeout: Duration) -> Self {
+    pub(crate) fn new(tx: PacketTx, timeout: Duration, version: Option<Vec<u8>>) -> Self {
         Rpc {
             tx,
             pending: Mutex::new(HashMap::new()),
             next_tid: AtomicU16::new(rand::random()),
             timeout,
+            version: version.map(ByteBuf::from),
         }
     }
 
@@ -104,29 +105,29 @@ impl Rpc {
         own: NodeId,
         q: &[u8],
         mut args: Args,
-    ) -> Result<Reply, Report<RpcError>> {
+    ) -> Result<Reply, RpcError> {
         args.id = own;
-        let (tid, rx) = self.register(addr).ok_or_else(|| report!(RpcError::Busy))?;
+        let (tid, rx) = self.register(addr).ok_or(RpcError::Busy)?;
         let _guard = PendingGuard { rpc: self, tid };
         let msg = Message {
             t: ByteBuf::from(tid.to_vec()),
             y: ByteBuf::from(b"q".to_vec()),
             q: Some(ByteBuf::from(q.to_vec())),
             a: Some(args),
-            v: Some(ByteBuf::from(CLIENT_VERSION.to_vec())),
+            v: self.version.clone(),
             ..Default::default()
         };
         self.tx.send(addr, msg.encode());
         let msg = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(m)) => m,
             _ => {
-                return Err(report!(RpcError::Timeout)
-                    .attach(format!("{} to {addr}", String::from_utf8_lossy(q))));
+                trace!(%addr, q = %String::from_utf8_lossy(q), "query timed out");
+                return Err(RpcError::Timeout);
             }
         };
         match &msg.y[..] {
             b"r" => {
-                let resp = msg.r.ok_or_else(|| report!(RpcError::Malformed))?;
+                let resp = msg.r.ok_or(RpcError::Malformed)?;
                 Ok(Reply {
                     resp,
                     seen_as: msg.ip.map(|c| c.0),
@@ -134,12 +135,12 @@ impl Rpc {
             }
             b"e" => {
                 let (code, text) = msg.e.unwrap_or((0, ByteBuf::new()));
-                Err(report!(RpcError::Remote(
+                Err(RpcError::Remote(
                     code,
-                    String::from_utf8_lossy(&text).into_owned()
-                )))
+                    String::from_utf8_lossy(&text).into_owned(),
+                ))
             }
-            _ => Err(report!(RpcError::Malformed)),
+            _ => Err(RpcError::Malformed),
         }
     }
 
@@ -158,7 +159,7 @@ impl Rpc {
         let mut msg = Message {
             t,
             ip: Some(CompactAddr(to)),
-            v: Some(ByteBuf::from(CLIENT_VERSION.to_vec())),
+            v: self.version.clone(),
             ..Default::default()
         };
         match result {

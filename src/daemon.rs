@@ -18,9 +18,9 @@ use crate::control::{ControlConfig, ControlEvent, ControlNode, PeerInfo};
 use crate::discovery::{self, PeerCache};
 use crate::identity::{KeySpec, PublicKey, Signer};
 use crate::manifest::{NetworkManifest, SignedManifest};
-use crate::net::dht::{Dht, DhtConfig};
 use crate::net::socket::{Endpoint, UdpMux};
 use crate::wg::{self, PeerConfig, WgEngine};
+use backscale_dht::{Dht, DhtConfig};
 use backscale_utp::{UtpConfig, UtpSocket};
 
 type Engine = WgEngine<tun_rs::AsyncDevice>;
@@ -125,6 +125,7 @@ pub async fn run(dir: StateDir) -> Result<(), Report> {
     let dht = config.dht.then(|| {
         let config = DhtConfig {
             nodes: load_dht_nodes(&dir),
+            client_version: Some(b"BK\x00\x01".to_vec()),
             ..Default::default()
         };
         Arc::new(Dht::new(config, mux.dht))

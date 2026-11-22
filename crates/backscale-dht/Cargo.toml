@@ -1,0 +1,25 @@
+[package]
+name = "backscale-dht"
+version = "0.1.0"
+edition = "2024"
+description = "BitTorrent mainline DHT node (BEP 5, 32, 42) over any datagram transport"
+license = "MIT"
+publish = false
+
+[dependencies]
+blake3 = { version = "1.8.7", features = ["pure"] }
+bt_bencode = "0.8.2"
+crc32c = "0.6.9"
+hex = "0.4.3"
+rand = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_bytes = "0.11.19"
+sha1 = "0.11.0"
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+rootcause = "0.13"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

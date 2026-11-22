@@ -2,13 +2,13 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use rootcause::prelude::*;
+use tokio::net::UdpSocket;
 
-use backscale::net::dht::node_id::NodeId;
-use backscale::net::dht::{Dht, DhtConfig};
-use backscale::net::socket::UdpMux;
+use backscale_dht::{Dht, DhtConfig, NodeId, Transport};
 
 #[derive(Parser)]
 #[command(name = "backscale-dht", version, about = "Mainline DHT debugging tool")]
@@ -47,9 +47,15 @@ fn main() -> ExitCode {
 }
 
 async fn run(bind: SocketAddr, cmd: Cmd) -> Result<(), Report> {
-    let mux = UdpMux::bind(bind).await?;
-    let port = mux.local_addr.port();
-    let dht = Dht::new(DhtConfig::default(), mux.dht);
+    let udp = Arc::new(
+        UdpSocket::bind(bind)
+            .await
+            .context("failed to bind UDP socket")
+            .attach(format!("address: {bind}"))?,
+    );
+    let port = udp.local_addr()?.port();
+    let (transport, _pump) = Transport::udp(udp);
+    let dht = Dht::new(DhtConfig::default(), transport);
     dht.bootstrap().await?;
     match cmd {
         Cmd::Bootstrap => {

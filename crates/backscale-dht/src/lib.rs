@@ -1,3 +1,9 @@
+//! A BitTorrent mainline DHT node (BEP 5, 32, 42) over any datagram
+//! transport: a plain UDP socket via [`Transport::udp`], or one protocol's
+//! share of a multiplexed socket.
+
+#![forbid(unsafe_code)]
+
 pub mod krpc;
 pub mod lookup;
 pub mod node_id;
@@ -6,23 +12,112 @@ pub mod server;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use rootcause::prelude::*;
 use serde_bytes::ByteBuf;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace};
 
-use self::krpc::{Rpc, RpcError};
+use self::krpc::Rpc;
+pub use self::krpc::RpcError;
 use self::lookup::{Kind, LookupResult, lookup};
-use self::node_id::NodeId;
+pub use self::node_id::NodeId;
 use self::routing::{K, RoutingTable};
 use self::server::Server;
-use self::wire::{Args, Message, NodeInfo, Resp};
-use crate::net::socket::{Datagram, Endpoint};
+pub use self::wire::NodeInfo;
+use self::wire::{Args, Message, Resp};
+
+const UDP_QUEUE: usize = 1024;
+
+pub type Datagram = (SocketAddr, Vec<u8>);
+
+/// Where KRPC messages come from and go to. Senders never block: a full queue
+/// drops the message, as a congested link would.
+pub struct Transport {
+    pub rx: mpsc::Receiver<Datagram>,
+    pub tx: mpsc::Sender<Datagram>,
+}
+
+impl Transport {
+    /// A transport owning `socket` exclusively.
+    pub fn udp(socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
+        let (in_tx, rx) = mpsc::channel(UDP_QUEUE);
+        let (tx, mut out_rx) = mpsc::channel::<Datagram>(UDP_QUEUE);
+        let task = tokio::spawn(async move {
+            let v6 = socket.local_addr().is_ok_and(|a| a.is_ipv6());
+            let recv = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    let _ = in_tx.try_send((canonical(from), buf[..n].to_vec()));
+                }
+            };
+            let send = async {
+                while let Some((to, data)) = out_rx.recv().await {
+                    if to.is_ipv6() && !v6 {
+                        continue;
+                    }
+                    let to = if v6 { mapped(to) } else { to };
+                    let _ = socket.send_to(&data, to).await;
+                }
+            };
+            tokio::join!(recv, send);
+        });
+        (Transport { rx, tx }, task)
+    }
+}
+
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), addr.port()),
+            None => addr,
+        },
+        IpAddr::V4(_) => addr,
+    }
+}
+
+fn mapped(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(v4) => SocketAddr::new(v4.to_ipv6_mapped().into(), addr.port()),
+        IpAddr::V6(_) => addr,
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PacketTx(mpsc::Sender<Datagram>);
+
+impl PacketTx {
+    pub(crate) fn send(&self, addr: SocketAddr, data: Vec<u8>) {
+        if self.0.try_send((addr, data)).is_err() {
+            trace!(%addr, "outgoing queue full, dropping packet");
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DhtError {
+    NoBootstrapNodes,
+    BootstrapFailed,
+}
+
+impl fmt::Display for DhtError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DhtError::NoBootstrapNodes => "no bootstrap nodes available",
+            DhtError::BootstrapFailed => "bootstrap failed: no nodes responded",
+        })
+    }
+}
+
+impl std::error::Error for DhtError {}
 
 pub const DEFAULT_ROUTERS: &[&str] = &[
     "router.bittorrent.com:6881",
@@ -70,6 +165,8 @@ pub struct DhtConfig {
     pub query_timeout: Duration,
     // Fixed node id; otherwise a BEP 42 id is derived once our external IP is known.
     pub id: Option<NodeId>,
+    // The KRPC `v` field: a two-letter client code and a version (BEP 20 style).
+    pub client_version: Option<Vec<u8>>,
 }
 
 impl Default for DhtConfig {
@@ -79,6 +176,7 @@ impl Default for DhtConfig {
             nodes: Vec::new(),
             query_timeout: Duration::from_secs(2),
             id: None,
+            client_version: None,
         }
     }
 }
@@ -112,7 +210,7 @@ impl Inner {
         expect: Option<NodeId>,
         q: &[u8],
         args: Args,
-    ) -> Result<Resp, Report<RpcError>> {
+    ) -> Result<Resp, RpcError> {
         let family = Family::of(&addr);
         match self.rpc.query(addr, self.own_id(), q, args).await {
             Ok(reply) => {
@@ -136,7 +234,7 @@ impl Inner {
             }
             Err(e) => {
                 if let Some(id) = expect
-                    && *e.current_context() == RpcError::Timeout
+                    && e == RpcError::Timeout
                 {
                     self.table(family).mark_failed(&id);
                 }
@@ -240,11 +338,15 @@ async fn lookup_both(inner: &Arc<Inner>, target: NodeId, kind: Kind) -> [LookupR
 }
 
 impl Dht {
-    pub fn new(config: DhtConfig, endpoint: Endpoint) -> Self {
+    pub fn new(config: DhtConfig, transport: Transport) -> Self {
         let now = Instant::now();
         let id = config.id.unwrap_or_else(NodeId::random);
         let inner = Arc::new(Inner {
-            rpc: Rpc::new(endpoint.tx, config.query_timeout),
+            rpc: Rpc::new(
+                PacketTx(transport.tx),
+                config.query_timeout,
+                config.client_version.clone(),
+            ),
             tables: [
                 Mutex::new(RoutingTable::new(id)),
                 Mutex::new(RoutingTable::new(id)),
@@ -254,7 +356,7 @@ impl Dht {
             verifying: Mutex::new(HashSet::new()),
             config,
         });
-        let recv = tokio::spawn(recv_loop(inner.clone(), endpoint.rx));
+        let recv = tokio::spawn(recv_loop(inner.clone(), transport.rx));
         let maint = tokio::spawn(maintain_loop(inner.clone()));
         Dht {
             inner,
@@ -291,7 +393,7 @@ impl Dht {
         }
     }
 
-    pub async fn bootstrap(&self) -> Result<usize, Report> {
+    pub async fn bootstrap(&self) -> Result<usize, DhtError> {
         bootstrap(&self.inner).await
     }
 
@@ -369,11 +471,11 @@ async fn resolve(routers: &[String]) -> Vec<SocketAddr> {
     out
 }
 
-async fn bootstrap(inner: &Arc<Inner>) -> Result<usize, Report> {
+async fn bootstrap(inner: &Arc<Inner>) -> Result<usize, DhtError> {
     let mut seeds = inner.config.nodes.clone();
     seeds.extend(resolve(&inner.config.routers).await);
     if seeds.is_empty() && inner.total_nodes() == 0 {
-        bail!("no bootstrap nodes available");
+        return Err(DhtError::NoBootstrapNodes);
     }
 
     // Ping seeds first to learn our external IP before choosing a BEP 42 id.
@@ -421,7 +523,7 @@ async fn bootstrap(inner: &Arc<Inner>) -> Result<usize, Report> {
     while set.join_next().await.is_some() {}
     let n = inner.total_nodes();
     if n == 0 {
-        bail!("bootstrap failed: no nodes responded");
+        return Err(DhtError::BootstrapFailed);
     }
     info!(
         ipv4_nodes = inner.table(Family::V4).len(),

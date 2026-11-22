@@ -144,6 +144,7 @@ name = "backscale"
 version = "0.2.0"
 dependencies = [
  "atomic-write-file",
+ "backscale-dht",
  "backscale-utp",
  "blake3",
  "boringtun",
@@ -182,6 +183,25 @@ dependencies = [
  "x509-cert",
  "yubikey",
  "zeroize",
+]
+
+[[package]]
+name = "backscale-dht"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bt_bencode",
+ "clap",
+ "crc32c",
+ "hex",
+ "rand 0.10.4",
+ "rootcause",
+ "serde",
+ "serde_bytes",
+ "sha1 0.11.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

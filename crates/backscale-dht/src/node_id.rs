@@ -2,7 +2,6 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use rootcause::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::Digest;
 
@@ -96,14 +95,23 @@ impl fmt::Debug for NodeId {
     }
 }
 
-impl FromStr for NodeId {
-    type Err = Report;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError;
 
-    fn from_str(s: &str) -> Result<Self, Report> {
-        let v = hex::decode(s).context("node id / infohash must be hex")?;
-        Ok(NodeId(v.try_into().map_err(|_| {
-            report!("node id / infohash must be 20 bytes")
-        })?))
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("node id / infohash must be 40 hex digits")
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl FromStr for NodeId {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        let v = hex::decode(s).map_err(|_| ParseError)?;
+        Ok(NodeId(v.try_into().map_err(|_| ParseError)?))
     }
 }
 

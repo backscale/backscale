@@ -1,9 +1,8 @@
-pub mod dht;
 pub mod lan;
 pub mod socket;
 
 use crate::manifest::NetId;
-use dht::node_id::NodeId;
+use backscale_dht::NodeId;
 
 pub const TOPIC_PERIOD_SECS: u64 = 3600;
 
