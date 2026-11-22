@@ -1,5 +1,5 @@
 use atomic_write_file::AtomicWriteFile;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,6 +27,7 @@ type Engine = WgEngine<tun_rs::AsyncDevice>;
 
 const DISCOVERY_TICK: Duration = Duration::from_secs(30);
 const DHT_ANNOUNCE_EVERY: Duration = Duration::from_secs(5 * 60);
+const LAN_RETRY: Duration = Duration::from_secs(5 * 60);
 const MAX_REQUEST: usize = 4 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +51,8 @@ pub struct Status {
     pub manifest_seq: u64,
     pub manifest_expires: Option<u64>,
     pub members: usize,
+    // None: no ACL, every member may reach every member.
+    pub acl_rules: Option<usize>,
     pub listen: SocketAddr,
     pub overlay: Option<(std::net::Ipv4Addr, std::net::Ipv6Addr)>,
     pub tun: Option<String>,
@@ -64,6 +67,8 @@ pub struct PeerStatus {
     pub identity: PublicKey,
     pub addr: SocketAddr,
     pub overlay: Option<std::net::Ipv4Addr>,
+    // Connected, but the ACL forbids overlay traffic with it.
+    pub blocked: bool,
     pub wg: Option<WgStatus>,
 }
 
@@ -157,7 +162,15 @@ pub async fn run(dir: StateDir) -> Result<(), Report> {
     tokio::spawn(refresh_binding(daemon.control.clone(), identity));
     let listener = bind_control_socket(&dir)?;
     tokio::spawn(serve_control(listener, daemon.clone()));
-    tokio::spawn(discovery(daemon.clone(), config.peers.clone()));
+    let (lan_tx, lan_rx) = tokio::sync::mpsc::channel(64);
+    if config.lan_discovery {
+        tokio::spawn(crate::net::lan::run(
+            daemon.control.net_id(),
+            local.port(),
+            lan_tx,
+        ));
+    }
+    tokio::spawn(discovery(daemon.clone(), config.peers.clone(), lan_rx));
     tokio::spawn(track_events(daemon.clone()));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -199,7 +212,12 @@ async fn refresh_binding(control: ControlNode, identity: Arc<dyn Signer>) {
     }
 }
 
-fn peer_config(manifest: &NetworkManifest, info: &PeerInfo) -> Option<PeerConfig> {
+// Peers the ACL doesn't allow get no WireGuard peer at all, so neither side
+// can send overlay traffic; the control session stays up.
+fn peer_config(manifest: &NetworkManifest, me: &PublicKey, info: &PeerInfo) -> Option<PeerConfig> {
+    if !manifest.allows(me, &info.identity) {
+        return None;
+    }
     let member = manifest.member(&info.identity)?;
     Some(PeerConfig {
         identity: info.identity.clone(),
@@ -215,8 +233,9 @@ fn reconcile(engine: &Engine, control: &ControlNode) {
     let Some(manifest) = control.manifest() else {
         return;
     };
+    let me = control.identity();
     for id in engine.identities() {
-        let Some(member) = manifest.member(&id) else {
+        let Some(member) = manifest.member(&id).filter(|_| manifest.allows(me, &id)) else {
             engine.remove_peer(&id);
             continue;
         };
@@ -230,7 +249,7 @@ fn reconcile(engine: &Engine, control: &ControlNode) {
         }
     }
     for info in control.peers() {
-        if let Some(cfg) = peer_config(&manifest, &info) {
+        if let Some(cfg) = peer_config(&manifest, me, &info) {
             engine.upsert_peer(cfg);
         }
     }
@@ -275,7 +294,7 @@ async fn dataplane(d: &Daemon, endpoint: Endpoint) -> Result<(), Report> {
         match events.recv().await {
             Ok(ControlEvent::PeerUp(info)) => {
                 if let Some(m) = d.control.manifest()
-                    && let Some(cfg) = peer_config(&m, &info)
+                    && let Some(cfg) = peer_config(&m, d.control.identity(), &info)
                 {
                     engine.upsert_peer(cfg);
                 }
@@ -408,7 +427,11 @@ fn local_addrs(local: SocketAddr, manifest: Option<&NetworkManifest>) -> Vec<Soc
     addrs
 }
 
-async fn discovery(d: Arc<Daemon>, static_peers: Vec<SocketAddr>) {
+async fn discovery(
+    d: Arc<Daemon>,
+    static_peers: Vec<SocketAddr>,
+    mut lan: tokio::sync::mpsc::Receiver<SocketAddr>,
+) {
     let connecting: Arc<Mutex<HashSet<SocketAddr>>> = Arc::default();
     let try_connect = |addr: SocketAddr| {
         if addr == d.local
@@ -430,9 +453,23 @@ async fn discovery(d: Arc<Daemon>, static_peers: Vec<SocketAddr>) {
 
     let mut bootstrapped = false;
     let mut last_announce: Option<Instant> = None;
+    // Peers re-announce every 30s, also when already connected over another address.
+    let mut lan_tried: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(DISCOVERY_TICK);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            Some(addr) = lan.recv() => {
+                let known = d.control.peers().iter().any(|p| p.endpoints().contains(&addr));
+                let recent = lan_tried.get(&addr).is_some_and(|t| t.elapsed() < LAN_RETRY);
+                if !known && !recent {
+                    lan_tried.insert(addr, Instant::now());
+                    try_connect(addr);
+                }
+                continue;
+            }
+        }
+        lan_tried.retain(|_, t| t.elapsed() < LAN_RETRY);
         let manifest = d.control.manifest();
         d.control
             .set_local_addrs(local_addrs(d.local, manifest.as_ref()));
@@ -548,6 +585,9 @@ fn handle(d: &Daemon, req: Request) -> Response {
                         .as_ref()
                         .and_then(|m| m.member(&p.identity))
                         .map(|m| m.ipv4),
+                    blocked: manifest
+                        .as_ref()
+                        .is_some_and(|m| !m.allows(d.control.identity(), &p.identity)),
                     wg: wg_stats.get(&p.name).map(|s| WgStatus {
                         endpoint: s.endpoint,
                         handshake_secs_ago: s.last_handshake.map(|d| d.as_secs()),
@@ -567,6 +607,10 @@ fn handle(d: &Daemon, req: Request) -> Response {
                 manifest_seq: d.control.manifest_seq(),
                 manifest_expires: manifest.as_ref().map(|m| m.expires_at),
                 members: manifest.as_ref().map_or(0, |m| m.members.len()),
+                acl_rules: manifest
+                    .as_ref()
+                    .and_then(|m| m.acl.as_ref())
+                    .map(|a| a.len()),
                 listen: d.local,
                 overlay: manifest
                     .as_ref()
@@ -610,4 +654,57 @@ pub async fn request(dir: &StateDir, req: Request) -> Result<Response, Report> {
         .attach(format!("socket: {}", path.display()))?;
     write_frame(&mut s, &req).await?;
     read_frame(&mut s).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::DeviceBinding;
+    use crate::identity::soft::SoftSigner;
+    use crate::manifest::ManifestDraft;
+
+    fn info(identity: PublicKey, net: &NetworkManifest) -> PeerInfo {
+        let addr: SocketAddr = "192.0.2.1:41641".parse().unwrap();
+        PeerInfo {
+            name: String::new(),
+            addr,
+            binding: DeviceBinding {
+                net_id: net.net_id,
+                identity: identity.clone(),
+                wg_public: [7; 32],
+                noise_public: [8; 32],
+                issued_at: 0,
+                expires_at: u64::MAX,
+            },
+            identity,
+            observed_us: addr,
+            local_addrs: vec![],
+        }
+    }
+
+    #[test]
+    fn peer_config_honours_acl() {
+        let net = SoftSigner::generate();
+        let ids: Vec<PublicKey> = (0..3)
+            .map(|_| SoftSigner::generate().public_key())
+            .collect();
+        let mut d = ManifestDraft::new(net.public_key(), "home".into()).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            d.add_member(id.clone(), format!("node{i}"), None, None, vec![])
+                .unwrap();
+        }
+        let open = d.next_manifest(1, 100);
+        assert!(peer_config(&open, &ids[0], &info(ids[2].clone(), &open)).is_some());
+
+        d.add_acl(
+            vec!["node0".parse().unwrap()],
+            vec!["node1".parse().unwrap()],
+        )
+        .unwrap();
+        let m = d.next_manifest(1, 100);
+        let cfg = peer_config(&m, &ids[0], &info(ids[1].clone(), &m)).unwrap();
+        assert_eq!(cfg.name, "node1");
+        assert!(peer_config(&m, &ids[0], &info(ids[2].clone(), &m)).is_none());
+        assert!(peer_config(&m, &ids[2], &info(ids[1].clone(), &m)).is_none());
+    }
 }

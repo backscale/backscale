@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub dht: bool,
     #[serde(default = "default_true")]
+    pub lan_discovery: bool,
+    #[serde(default = "default_true")]
     pub tun: bool,
     #[serde(default = "default_tun_name")]
     pub tun_name: String,

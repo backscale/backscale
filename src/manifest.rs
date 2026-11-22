@@ -10,9 +10,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::identity::{PublicKey, Signature, Signer};
 
-pub const MANIFEST_DOMAIN: &[u8] = b"backscale/manifest/v1";
+// v2 added `acl`; postcard can't skip unknown fields, so the format changed.
+pub const MANIFEST_DOMAIN: &[u8] = b"backscale/manifest/v2";
 pub const MAX_MANIFEST_BYTES: usize = 1 << 20;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+pub const MAX_ACL_RULES: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NetId(pub [u8; 32]);
@@ -89,6 +91,105 @@ pub struct Member {
     pub tags: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Selector {
+    Any,
+    Member(String),
+    Tag(String),
+}
+
+impl Selector {
+    fn matches(&self, m: &Member) -> bool {
+        match self {
+            Selector::Any => true,
+            Selector::Member(name) => &m.name == name,
+            Selector::Tag(tag) => m.tags.contains(tag),
+        }
+    }
+}
+
+impl std::str::FromStr for Selector {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Report> {
+        let sel = match s {
+            "*" => Selector::Any,
+            _ => match s.strip_prefix("tag:") {
+                Some(tag) => Selector::Tag(tag.into()),
+                None => Selector::Member(s.into()),
+            },
+        };
+        match &sel {
+            Selector::Member(n) | Selector::Tag(n) if !valid_name(n) => {
+                bail!("invalid selector `{s}` (use `*`, a member name or `tag:<tag>`)")
+            }
+            _ => Ok(sel),
+        }
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Selector::Any => write!(f, "*"),
+            Selector::Member(name) => write!(f, "{name}"),
+            Selector::Tag(tag) => write!(f, "tag:{tag}"),
+        }
+    }
+}
+
+impl Serialize for Selector {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Selector {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(|e: Report| serde::de::Error::custom(e))
+    }
+}
+
+// An enum so port rules can be added as a new variant later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AclRule {
+    // Symmetric: members matching `from` and members matching `to` may reach
+    // each other. Directional rules need connection tracking for replies.
+    Hosts {
+        from: Vec<Selector>,
+        to: Vec<Selector>,
+    },
+}
+
+impl AclRule {
+    fn permits(&self, a: &Member, b: &Member) -> bool {
+        match self {
+            AclRule::Hosts { from, to } => {
+                let pair = |x: &Member, y: &Member| {
+                    from.iter().any(|s| s.matches(x)) && to.iter().any(|s| s.matches(y))
+                };
+                pair(a, b) || pair(b, a)
+            }
+        }
+    }
+}
+
+impl fmt::Display for AclRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let join = |v: &[Selector]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        match self {
+            AclRule::Hosts { from, to } => write!(f, "{} <-> {}", join(from), join(to)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkManifest {
     pub net_id: NetId,
@@ -99,6 +200,8 @@ pub struct NetworkManifest {
     pub expires_at: u64,
     pub settings: Settings,
     pub members: Vec<Member>,
+    // None: every member may reach every member. Some: only what a rule permits.
+    pub acl: Option<Vec<AclRule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,11 +259,26 @@ impl NetworkManifest {
         if self.issued_at >= self.expires_at {
             return Err(invalid("issued_at must be before expires_at"));
         }
-        validate_members(&self.settings, &self.members)
+        validate_members(&self.settings, &self.members)?;
+        match &self.acl {
+            Some(rules) => validate_acl(&self.members, rules),
+            None => Ok(()),
+        }
     }
 
     pub fn member(&self, identity: &PublicKey) -> Option<&Member> {
         self.members.iter().find(|m| &m.identity == identity)
+    }
+
+    // Whether overlay traffic may flow between two members.
+    pub fn allows(&self, a: &PublicKey, b: &PublicKey) -> bool {
+        let (Some(ma), Some(mb)) = (self.member(a), self.member(b)) else {
+            return false;
+        };
+        match &self.acl {
+            None => true,
+            Some(rules) => rules.iter().any(|r| r.permits(ma, mb)),
+        }
     }
 
     pub fn sign(&self, network_key: &dyn Signer) -> Result<SignedManifest, Report> {
@@ -195,6 +313,9 @@ fn validate_members(settings: &Settings, members: &[Member]) -> Result<(), Repor
         if !names.insert(&m.name) {
             return Err(invalid(format!("duplicate name `{who}`")));
         }
+        if let Some(t) = m.tags.iter().find(|t| !valid_name(t)) {
+            return Err(invalid(format!("invalid tag `{t}` on `{who}`")));
+        }
         if !v4.insert(m.ipv4) {
             return Err(invalid(format!("duplicate ipv4 {} (`{who}`)", m.ipv4)));
         }
@@ -212,6 +333,32 @@ fn validate_members(settings: &Settings, members: &[Member]) -> Result<(), Repor
                 "ipv6 {} of `{who}` is not a host in {p6}",
                 m.ipv6
             )));
+        }
+    }
+    Ok(())
+}
+
+// Selectors must name existing members and tags, to catch typos at sign time.
+fn validate_acl(members: &[Member], rules: &[AclRule]) -> Result<(), Report<ManifestError>> {
+    if rules.len() > MAX_ACL_RULES {
+        return Err(invalid(format!("more than {MAX_ACL_RULES} ACL rules")));
+    }
+    for rule in rules {
+        let AclRule::Hosts { from, to } = rule;
+        if from.is_empty() || to.is_empty() {
+            return Err(invalid(format!("ACL rule `{rule}` has an empty side")));
+        }
+        for sel in from.iter().chain(to) {
+            let known = match sel {
+                Selector::Any => true,
+                Selector::Member(n) => members.iter().any(|m| &m.name == n),
+                Selector::Tag(t) => members.iter().any(|m| m.tags.contains(t)),
+            };
+            if !known {
+                return Err(invalid(format!(
+                    "ACL rule `{rule}` refers to `{sel}`, which matches no member"
+                )));
+            }
         }
     }
     Ok(())
@@ -328,6 +475,22 @@ pub fn diff(old: Option<&NetworkManifest>, new: &NetworkManifest) -> ManifestDif
     d
 }
 
+// A host rule in the TOML draft: `[[acl]] from = [...] to = [...]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRule {
+    pub from: Vec<Selector>,
+    pub to: Vec<Selector>,
+}
+
+impl DraftRule {
+    fn rule(&self) -> AclRule {
+        AclRule::Hosts {
+            from: self.from.clone(),
+            to: self.to.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestDraft {
     pub network_key: PublicKey,
@@ -336,6 +499,8 @@ pub struct ManifestDraft {
     pub settings: Settings,
     #[serde(default)]
     pub members: Vec<Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl: Option<Vec<DraftRule>>,
 }
 
 impl ManifestDraft {
@@ -353,7 +518,63 @@ impl ManifestDraft {
             name,
             last_seq: 0,
             members: Vec::new(),
+            acl: None,
         })
+    }
+
+    fn rules(&self) -> Option<Vec<AclRule>> {
+        self.acl
+            .as_ref()
+            .map(|v| v.iter().map(DraftRule::rule).collect())
+    }
+
+    pub fn add_acl(&mut self, from: Vec<Selector>, to: Vec<Selector>) -> Result<(), Report> {
+        let mut rules = self.rules().unwrap_or_default();
+        let new = DraftRule { from, to };
+        rules.push(new.rule());
+        validate_acl(&self.members, &rules).map_err(|e| e.into_dynamic())?;
+        self.acl.get_or_insert_with(Vec::new).push(new);
+        Ok(())
+    }
+
+    // `n` counts from 1, as `net acl list` shows.
+    pub fn remove_acl(&mut self, n: usize) -> Result<DraftRule, Report> {
+        let rules = self
+            .acl
+            .as_mut()
+            .ok_or_else(|| report!("the draft has no ACL"))?;
+        if n == 0 || n > rules.len() {
+            bail!("no ACL rule {n} (the draft has {})", rules.len());
+        }
+        Ok(rules.remove(n - 1))
+    }
+
+    pub fn clear_acl(&mut self) {
+        self.acl = None;
+    }
+
+    pub fn set_tags(
+        &mut self,
+        who: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<&Member, Report> {
+        let idx = self
+            .members
+            .iter()
+            .position(|m| m.name == who || m.identity.to_string() == who)
+            .ok_or_else(|| report!("no member named or keyed `{who}`"))?;
+        let mut members = self.members.clone();
+        let tags = &mut members[idx].tags;
+        tags.retain(|t| !remove.contains(t));
+        for t in add {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        validate_members(&self.settings, &members).map_err(|e| e.into_dynamic())?;
+        self.members = members;
+        Ok(&self.members[idx])
     }
 
     pub fn net_id(&self) -> NetId {
@@ -427,6 +648,7 @@ impl ManifestDraft {
             expires_at: now + validity_secs,
             settings: self.settings.clone(),
             members: self.members.clone(),
+            acl: self.rules(),
         }
     }
 
@@ -612,5 +834,109 @@ mod tests {
         let path = dir.path().join("net.toml");
         draft.save(&path).unwrap();
         assert_eq!(ManifestDraft::load(&path).unwrap(), draft);
+    }
+
+    fn sel(s: &str) -> Selector {
+        s.parse().unwrap()
+    }
+
+    // node0 is tagged admin, node1 server, node2 untagged.
+    fn tagged() -> (SoftSigner, ManifestDraft, Vec<PublicKey>) {
+        let (net, mut d, nodes) = setup(3);
+        d.set_tags("node0", &["admin".into()], &[]).unwrap();
+        d.set_tags("node1", &["server".into()], &[]).unwrap();
+        (net, d, nodes.iter().map(|n| n.public_key()).collect())
+    }
+
+    #[test]
+    fn selector_parse_display() {
+        for s in ["*", "node0", "tag:admin"] {
+            assert_eq!(sel(s).to_string(), s);
+        }
+        assert_eq!(sel("tag:x"), Selector::Tag("x".into()));
+        for bad in ["tag:", "", "Bad Name", "tag:UP"] {
+            assert!(bad.parse::<Selector>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn acl_allows() {
+        let (_, mut d, id) = tagged();
+        assert!(
+            d.next_manifest(NOW, DAY).allows(&id[0], &id[2]),
+            "no ACL allows all"
+        );
+
+        d.add_acl(vec![sel("tag:admin")], vec![sel("tag:server")])
+            .unwrap();
+        let m = d.next_manifest(NOW, DAY);
+        assert!(m.allows(&id[0], &id[1]));
+        assert!(m.allows(&id[1], &id[0]), "rules are symmetric");
+        assert!(!m.allows(&id[0], &id[2]));
+        assert!(!m.allows(&id[2], &id[1]));
+        let outsider = SoftSigner::generate().public_key();
+        assert!(!m.allows(&id[0], &outsider), "non-members never");
+
+        d.add_acl(vec![sel("node2")], vec![sel("*")]).unwrap();
+        let m = d.next_manifest(NOW, DAY);
+        assert!(m.allows(&id[2], &id[0]) && m.allows(&id[1], &id[2]));
+
+        d.remove_acl(1).unwrap();
+        d.remove_acl(1).unwrap();
+        let m = d.next_manifest(NOW, DAY);
+        assert_eq!(m.acl, Some(vec![]));
+        assert!(!m.allows(&id[0], &id[1]), "an empty ACL denies everything");
+
+        d.clear_acl();
+        assert!(d.next_manifest(NOW, DAY).allows(&id[0], &id[1]));
+    }
+
+    #[test]
+    fn acl_validation() {
+        let (net, mut d, _) = tagged();
+        assert!(d.add_acl(vec![sel("nobody")], vec![sel("*")]).is_err());
+        assert!(d.add_acl(vec![sel("tag:ghost")], vec![sel("*")]).is_err());
+        assert!(d.add_acl(vec![], vec![sel("*")]).is_err());
+        assert!(d.acl.is_none(), "a rejected rule leaves the draft alone");
+        assert!(d.set_tags("node0", &["Not Valid".into()], &[]).is_err());
+        assert!(d.remove_acl(1).is_err());
+
+        d.add_acl(vec![sel("node0")], vec![sel("node1")]).unwrap();
+        d.remove_member("node1").unwrap();
+        assert!(
+            d.next_manifest(NOW, DAY).sign(&net).is_err(),
+            "a rule naming a removed member must not sign"
+        );
+    }
+
+    #[test]
+    fn acl_signed_roundtrip_and_toml() {
+        let (net, mut d, _) = tagged();
+        d.add_acl(vec![sel("tag:admin")], vec![sel("*")]).unwrap();
+        let m = d.next_manifest(NOW, DAY);
+        let bytes = m.sign(&net).unwrap().to_bytes();
+        let back = SignedManifest::from_bytes(&bytes)
+            .unwrap()
+            .verify(&net.public_key(), NOW)
+            .unwrap();
+        assert_eq!(back, m);
+
+        let text = toml::to_string_pretty(&d).unwrap();
+        assert!(
+            text.contains("[[acl]]") && text.contains("\"tag:admin\""),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<ManifestDraft>(&text).unwrap(), d);
+    }
+
+    #[test]
+    fn v1_signature_rejected() {
+        let (net, mut d, _) = setup(1);
+        let body = postcard::to_stdvec(&d.next_manifest(NOW, DAY)).unwrap();
+        let signature = net.sign_domain(b"backscale/manifest/v1", &body).unwrap();
+        let err = SignedManifest { body, signature }
+            .verify(&net.public_key(), NOW)
+            .unwrap_err();
+        assert_eq!(err.current_context(), &ManifestError::BadSignature);
     }
 }

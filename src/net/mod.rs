@@ -1,4 +1,5 @@
 pub mod dht;
+pub mod lan;
 pub mod socket;
 pub mod utp;
 

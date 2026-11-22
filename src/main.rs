@@ -13,7 +13,7 @@ use backscale::config::{Config, StateDir};
 use backscale::daemon::{self, Request, Response, Status};
 use backscale::identity::soft::SoftSigner;
 use backscale::identity::{KeySpec, PublicKey, Signer};
-use backscale::manifest::{ManifestDraft, NetworkManifest, SignedManifest};
+use backscale::manifest::{ManifestDraft, NetworkManifest, Selector, SignedManifest};
 
 mod card;
 
@@ -172,6 +172,21 @@ enum NetCmd {
         #[arg(long, default_value = "net.toml")]
         draft: PathBuf,
     },
+    /// Add or remove a member's tags in the manifest draft.
+    Tag {
+        who: String,
+        #[arg(long = "add")]
+        add: Vec<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+    },
+    /// Edit the draft's ACL (who may reach whom over the overlay).
+    Acl {
+        #[command(subcommand)]
+        cmd: AclCmd,
+    },
     /// Sign the draft into a new manifest version.
     Sign {
         #[arg(long)]
@@ -197,6 +212,92 @@ enum NetCmd {
         #[arg(long)]
         pin: Option<PublicKey>,
     },
+}
+
+#[derive(Subcommand)]
+enum AclCmd {
+    /// Allow members matching `--from` and members matching `--to` to reach
+    /// each other. Selectors: `*`, a member name or `tag:<tag>`.
+    Add {
+        #[arg(long, required = true, num_args = 1..)]
+        from: Vec<String>,
+        #[arg(long, required = true, num_args = 1..)]
+        to: Vec<String>,
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+    },
+    /// List the draft's ACL rules.
+    List {
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+    },
+    /// Remove rule N (as numbered by `list`).
+    Remove {
+        n: usize,
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+    },
+    /// Drop the ACL: every member may reach every member again.
+    Clear {
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+    },
+}
+
+fn selectors(raw: &[String]) -> Result<Vec<Selector>, Report> {
+    raw.iter().map(|s| s.parse()).collect()
+}
+
+fn acl_cmd(cmd: AclCmd) -> Result<(), Report> {
+    match cmd {
+        AclCmd::Add { from, to, draft } => {
+            let mut d = ManifestDraft::load(&draft)?;
+            d.add_acl(selectors(&from)?, selectors(&to)?)
+                .context("failed to add ACL rule")?;
+            d.save(&draft)?;
+            println!("added rule {}", d.acl.as_ref().map_or(0, |a| a.len()));
+        }
+        AclCmd::List { draft } => {
+            let d = ManifestDraft::load(&draft)?;
+            match &d.acl {
+                None => println!("no ACL: every member may reach every member"),
+                Some(rules) if rules.is_empty() => {
+                    println!("empty ACL: no member may reach any other")
+                }
+                Some(rules) => {
+                    for (i, r) in rules.iter().enumerate() {
+                        let join = |v: &[Selector]| {
+                            v.iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        };
+                        println!("{}. {} <-> {}", i + 1, join(&r.from), join(&r.to));
+                    }
+                }
+            }
+        }
+        AclCmd::Remove { n, draft } => {
+            let mut d = ManifestDraft::load(&draft)?;
+            d.remove_acl(n)?;
+            d.save(&draft)?;
+            if d.acl.as_ref().is_some_and(|a| a.is_empty()) {
+                println!(
+                    "removed rule {n}; the ACL is now empty, so no member may reach any other"
+                );
+                println!("(use `net acl clear` to allow everything again)");
+            } else {
+                println!("removed rule {n}");
+            }
+        }
+        AclCmd::Clear { draft } => {
+            let mut d = ManifestDraft::load(&draft)?;
+            d.clear_acl();
+            d.save(&draft)?;
+            println!("ACL cleared: every member may reach every member");
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -359,6 +460,18 @@ fn net_cmd(cmd: NetCmd) -> Result<(), Report> {
             d.save(&draft)?;
             println!("removed {} ({})", m.name, m.identity);
         }
+        NetCmd::Tag {
+            who,
+            add,
+            remove,
+            draft,
+        } => {
+            let mut d = ManifestDraft::load(&draft)?;
+            let m = d.set_tags(&who, &add, &remove)?;
+            println!("{}: [{}]", m.name, m.tags.join(","));
+            d.save(&draft)?;
+        }
+        NetCmd::Acl { cmd } => acl_cmd(cmd)?,
         NetCmd::Sign {
             network_key,
             draft,
@@ -452,6 +565,7 @@ fn join(
         listen,
         peers,
         dht,
+        lan_discovery: true,
         tun: true,
         tun_name: "backscale0".into(),
     };
@@ -480,6 +594,10 @@ fn print_status(s: &Status) {
         "manifest: seq {} ({} members, expires {expires})",
         s.manifest_seq, s.members
     );
+    match s.acl_rules {
+        None => println!("acl:      none (every member may reach every member)"),
+        Some(n) => println!("acl:      {n} rules"),
+    }
     println!("listen:   {}", s.listen);
     match (&s.overlay, &s.tun) {
         (Some((v4, v6)), Some(dev)) => println!("overlay:  {v4} {v6} on {dev}"),
@@ -493,6 +611,7 @@ fn print_status(s: &Status) {
     for p in &s.peers {
         let overlay = p.overlay.map(|ip| ip.to_string()).unwrap_or_default();
         let wg = match &p.wg {
+            _ if p.blocked => "blocked by ACL".into(),
             Some(w) => format!(
                 "wg {} handshake {} tx {} rx {}",
                 w.endpoint,
@@ -523,6 +642,15 @@ fn print_manifest(m: &NetworkManifest) {
         "prefixes: {} {}",
         m.settings.ipv4_prefix, m.settings.ipv6_prefix
     );
+    match &m.acl {
+        None => println!("acl:      none (every member may reach every member)"),
+        Some(rules) => {
+            println!("acl:      {} rules", rules.len());
+            for (i, r) in rules.iter().enumerate() {
+                println!("  {}. {r}", i + 1);
+            }
+        }
+    }
     println!("members:  {}", m.members.len());
     for mem in &m.members {
         let tags = if mem.tags.is_empty() {

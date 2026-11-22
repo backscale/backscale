@@ -284,6 +284,7 @@ mod imp {
             listen,
             peers,
             dht,
+            lan_discovery: true,
             tun: true,
             tun_name: "backscale0".into(),
         };

@@ -194,7 +194,10 @@ impl ControlNode {
                     info!(seq = m.0.seq, "loaded manifest");
                     state.manifest = Some(m);
                 }
-                Err(e) => warn!(error = %e, "ignoring stored manifest"),
+                Err(e) => warn!(
+                    error = %e,
+                    "ignoring stored manifest; one signed by an older backscale must be re-signed with `backscale net sign`"
+                ),
             }
         }
         let seq = state.manifest.as_ref().map_or(0, |(m, _)| m.seq);

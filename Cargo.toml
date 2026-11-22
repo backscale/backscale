@@ -19,7 +19,7 @@ der = { version = "0.7", optional = true }
 ed25519-dalek = "3.0.0"
 hex = "0.4.3"
 humantime = "2.4.0"
-if-addrs = "0.15.0"
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 openpgp-card = { version = "0.7", optional = true }
 p256 = "0.14.0"
@@ -34,7 +34,7 @@ sha1 = "0.11.0"
 sha2 = "0.11"
 # Not the defaults: snow's `std` feature pulls in ring.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
-socket2 = "0.6.5"
+socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
 toml = "1.2.1"
 tracing = "0.1.44"
