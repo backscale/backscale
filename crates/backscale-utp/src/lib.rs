@@ -39,30 +39,33 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// A transport owning `socket` exclusively.
+    /// A transport owning `socket` exclusively. The returned task receives;
+    /// sending runs in its own task (so both can use separate threads) and
+    /// ends once every sender is dropped.
     pub fn udp(socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
         let (in_tx, rx) = mpsc::channel(UDP_QUEUE);
         let (tx, mut out_rx) = mpsc::channel::<Datagram>(UDP_QUEUE);
-        let task = tokio::spawn(async move {
-            let v6 = socket.local_addr().is_ok_and(|a| a.is_ipv6());
-            let recv = async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    let Ok((n, from)) = socket.recv_from(&mut buf).await else {
-                        continue;
-                    };
-                    let _ = in_tx.try_send((canonical(from), buf[..n].to_vec()));
+        let v6 = socket.local_addr().is_ok_and(|a| a.is_ipv6());
+        let send_sock = socket.clone();
+        tokio::spawn(async move {
+            while let Some((to, data)) = out_rx.recv().await {
+                if to.is_ipv6() && !v6 {
+                    continue;
                 }
-            };
-            let send = async {
-                while let Some((to, data)) = out_rx.recv().await {
-                    let to = if v6 { mapped(to) } else { to };
-                    let _ = socket.send_to(&data, to).await;
-                }
-            };
-            tokio::join!(recv, send);
+                let to = if v6 { mapped(to) } else { to };
+                let _ = send_sock.send_to(&data, to).await;
+            }
         });
-        (Transport { rx, tx }, task)
+        let recv = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let _ = in_tx.try_send((canonical(from), buf[..n].to_vec()));
+            }
+        });
+        (Transport { rx, tx }, recv)
     }
 }
 
