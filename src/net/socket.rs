@@ -88,30 +88,22 @@ impl Proto {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Datagram {
-    pub addr: SocketAddr,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug)]
-pub struct Outgoing {
-    pub addr: SocketAddr,
-    pub data: Vec<u8>,
-}
+// The datagram shape every protocol on the mux uses; the uTP and DHT crates'
+// transports carry exactly this, so one mux can feed both.
+pub type Datagram = (SocketAddr, Vec<u8>);
 
 #[derive(Clone)]
 pub struct PacketTx {
-    tx: mpsc::Sender<Outgoing>,
+    tx: mpsc::Sender<Datagram>,
 }
 
 impl PacketTx {
-    pub fn new(tx: mpsc::Sender<Outgoing>) -> Self {
+    pub fn new(tx: mpsc::Sender<Datagram>) -> Self {
         PacketTx { tx }
     }
 
     pub fn send(&self, addr: SocketAddr, data: Vec<u8>) {
-        if self.tx.try_send(Outgoing { addr, data }).is_err() {
+        if self.tx.try_send((addr, data)).is_err() {
             trace!(%addr, "outgoing queue full, dropping packet");
         }
     }
@@ -125,7 +117,7 @@ pub struct Endpoint {
 pub struct UdpMux {
     pub local_addr: SocketAddr,
     pub dht: Endpoint,
-    pub utp: Endpoint,
+    pub utp: backscale_utp::Transport,
     pub wg: Endpoint,
     pub tasks: MuxTasks,
 }
@@ -148,7 +140,7 @@ impl UdpMux {
         let socket = std::sync::Arc::new(UdpSocket::from_std(std_socket)?);
         let local_addr = socket.local_addr()?;
         let is_v6 = local_addr.is_ipv6();
-        let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(QUEUE);
+        let (out_tx, mut out_rx) = mpsc::channel::<Datagram>(QUEUE);
         let (dht_tx, dht_rx) = mpsc::channel(QUEUE);
         let (utp_tx, utp_rx) = mpsc::channel(QUEUE);
         let (wg_tx, wg_rx) = mpsc::channel(QUEUE);
@@ -170,10 +162,7 @@ impl UdpMux {
                     trace!(%addr, "dropping unclassifiable packet");
                     continue;
                 };
-                let dg = Datagram {
-                    addr,
-                    data: buf[..n].to_vec(),
-                };
+                let dg = (addr, buf[..n].to_vec());
                 let tx = match proto {
                     Proto::Dht => &dht_tx,
                     Proto::Utp => &utp_tx,
@@ -186,13 +175,13 @@ impl UdpMux {
         });
 
         let send = tokio::spawn(async move {
-            while let Some(o) = out_rx.recv().await {
-                let dst = if is_v6 { mapped(o.addr) } else { o.addr };
-                if o.addr.is_ipv6() && !is_v6 {
+            while let Some((addr, data)) = out_rx.recv().await {
+                let dst = if is_v6 { mapped(addr) } else { addr };
+                if addr.is_ipv6() && !is_v6 {
                     continue;
                 }
-                if let Err(e) = socket.send_to(&o.data, dst).await {
-                    debug!(addr = %o.addr, error = %e, "udp send error");
+                if let Err(e) = socket.send_to(&data, dst).await {
+                    debug!(%addr, error = %e, "udp send error");
                 }
             }
         });
@@ -203,9 +192,9 @@ impl UdpMux {
                 rx: dht_rx,
                 tx: PacketTx::new(out_tx.clone()),
             },
-            utp: Endpoint {
+            utp: backscale_utp::Transport {
                 rx: utp_rx,
-                tx: PacketTx::new(out_tx.clone()),
+                tx: out_tx.clone(),
             },
             wg: Endpoint {
                 rx: wg_rx,
@@ -255,26 +244,26 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], port)),
             b"d1:xi4ee".to_vec(),
         );
-        let got = a.dht.rx.recv().await.unwrap();
-        assert_eq!(
-            got.addr, b4.local_addr,
-            "IPv4 peer must appear as plain IPv4"
-        );
-        a.dht.tx.send(got.addr, b"d1:xi5ee".to_vec());
-        assert_eq!(b4.dht.rx.recv().await.unwrap().data, b"d1:xi5ee");
+        let (from, _) = a.dht.rx.recv().await.unwrap();
+        assert_eq!(from, b4.local_addr, "IPv4 peer must appear as plain IPv4");
+        a.dht.tx.send(from, b"d1:xi5ee".to_vec());
+        assert_eq!(b4.dht.rx.recv().await.unwrap().1, b"d1:xi5ee");
 
         let Ok(mut b6) = UdpMux::bind("[::1]:0".parse().unwrap()).await else {
             eprintln!("host has no IPv6 loopback, skipping the IPv6 half");
             return;
         };
-        b6.utp.tx.send(
-            SocketAddr::new("::1".parse().unwrap(), port),
-            vec![0x21, 0, 0, 7],
-        );
-        let got = a.utp.rx.recv().await.unwrap();
-        assert_eq!(got.addr, b6.local_addr);
-        a.utp.tx.send(got.addr, vec![0x21, 0, 0, 8]);
-        assert_eq!(b6.utp.rx.recv().await.unwrap().data, vec![0x21, 0, 0, 8]);
+        b6.utp
+            .tx
+            .try_send((
+                SocketAddr::new("::1".parse().unwrap(), port),
+                vec![0x21, 0, 0, 7],
+            ))
+            .unwrap();
+        let (from, _) = a.utp.rx.recv().await.unwrap();
+        assert_eq!(from, b6.local_addr);
+        a.utp.tx.try_send((from, vec![0x21, 0, 0, 8])).unwrap();
+        assert_eq!(b6.utp.rx.recv().await.unwrap().1, vec![0x21, 0, 0, 8]);
     }
 
     #[tokio::test]
@@ -283,14 +272,13 @@ mod tests {
         let mut b = UdpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let utp = vec![0x01, 0, 0x12, 0x34];
         let wg = vec![0x01, 0, 0, 0, 9];
-        a.utp.tx.send(b.local_addr, utp.clone());
+        a.utp.tx.try_send((b.local_addr, utp.clone())).unwrap();
         a.dht.tx.send(b.local_addr, b"de".to_vec());
         a.wg.tx.send(b.local_addr, wg.clone());
-        let u = b.utp.rx.recv().await.unwrap();
-        assert_eq!((u.addr, u.data), (a.local_addr, utp));
-        assert_eq!(b.dht.rx.recv().await.unwrap().data, b"de");
-        assert_eq!(b.wg.rx.recv().await.unwrap().data, wg);
+        assert_eq!(b.utp.rx.recv().await.unwrap(), (a.local_addr, utp));
+        assert_eq!(b.dht.rx.recv().await.unwrap().1, b"de");
+        assert_eq!(b.wg.rx.recv().await.unwrap().1, wg);
         b.dht.tx.send(a.local_addr, b"d1:xi1ee".to_vec());
-        assert_eq!(a.dht.rx.recv().await.unwrap().data, b"d1:xi1ee");
+        assert_eq!(a.dht.rx.recv().await.unwrap().1, b"d1:xi1ee");
     }
 }

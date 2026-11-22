@@ -177,9 +177,8 @@ impl Inner {
         counts.into_iter().max_by_key(|(_, n)| *n).map(|(ip, _)| ip)
     }
 
-    fn handle_datagram(self: &Arc<Self>, dg: Datagram) {
-        let from = dg.addr;
-        let msg = match Message::decode(&dg.data) {
+    fn handle_datagram(self: &Arc<Self>, (from, data): Datagram) {
+        let msg = match Message::decode(&data) {
             Ok(m) => m,
             Err(e) => {
                 trace!(%from, error = %e, "undecodable KRPC packet");

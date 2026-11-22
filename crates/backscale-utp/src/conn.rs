@@ -12,7 +12,7 @@ use super::UtpConfig;
 use super::ledbat::Ledbat;
 use super::packet::{Packet, Type, sack_build, sack_contains, seq_le, seq_lt};
 use super::rtt::Rtt;
-use crate::net::socket::PacketTx;
+use crate::PacketTx;
 
 // Keeps a full packet under ~1200 bytes, safe for tunnels and odd MTUs.
 pub const PAYLOAD: usize = 1150;

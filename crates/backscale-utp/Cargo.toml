@@ -1,0 +1,20 @@
+[package]
+name = "backscale-utp"
+version = "0.1.0"
+edition = "2024"
+description = "uTP (BEP 29) streams over any datagram transport"
+license = "MIT"
+publish = false
+
+[dependencies]
+rand = "0.10.4"
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+blake3 = { version = "1.8.7", features = ["pure"] }
+clap = { version = "4.6.8", features = ["derive"] }
+hex = "0.4.3"
+rootcause = "0.13"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

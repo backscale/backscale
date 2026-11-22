@@ -1,7 +1,6 @@
 pub mod dht;
 pub mod lan;
 pub mod socket;
-pub mod utp;
 
 use crate::manifest::NetId;
 use dht::node_id::NodeId;

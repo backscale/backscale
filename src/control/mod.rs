@@ -20,7 +20,7 @@ use crate::binding::{DEFAULT_BINDING_LIFETIME_SECS, DeviceBinding, SessionKeys, 
 use crate::discovery::MAX_ENDPOINTS;
 use crate::identity::{PublicKey, Signer};
 use crate::manifest::{self, ManifestDiff, ManifestError, NetId, NetworkManifest, SignedManifest};
-use crate::net::utp::{UtpSocket, UtpStream};
+use backscale_utp::{UtpSocket, UtpStream};
 
 const PROLOGUE: &[u8] = b"backscale/control/v1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -327,7 +327,7 @@ impl ControlNode {
             .utp
             .connect(addr)
             .await
-            .map_err(|e| e.into_dynamic())?;
+            .map_err(|e| report!(e).attach(format!("peer: {addr}")))?;
         spawn_session(self.inner.clone(), stream, true);
         Ok(())
     }

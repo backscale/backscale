@@ -325,9 +325,9 @@ async fn tun_loop<T: TunDevice>(e: Arc<Engine<T>>) {
 
 async fn net_loop<T: TunDevice>(e: Arc<Engine<T>>, mut rx: mpsc::Receiver<Datagram>) {
     let mut buf = vec![0u8; BUF];
-    while let Some(dg) = rx.recv().await {
-        let Some(peer) = e.peer_for_packet(&dg.data) else {
-            trace!(addr = %dg.addr, "wireguard packet from unknown peer");
+    while let Some((from, data)) = rx.recv().await {
+        let Some(peer) = e.peer_for_packet(&data) else {
+            trace!(addr = %from, "wireguard packet from unknown peer");
             continue;
         };
         let deliver = {
@@ -336,14 +336,14 @@ async fn net_loop<T: TunDevice>(e: Arc<Engine<T>>, mut rx: mpsc::Receiver<Datagr
             // A cookie reply goes out to unverified senders under load, and a
             // bare cookie reply or handshake response proves nothing either.
             let authenticated;
-            let deliver = match tunn.decapsulate(Some(dg.addr.ip()), &dg.data, &mut buf) {
+            let deliver = match tunn.decapsulate(Some(from.ip()), &data, &mut buf) {
                 TunnResult::WriteToNetwork(p) => {
                     authenticated = p.first() != Some(&MSG_COOKIE_REPLY);
-                    e.tx.send(dg.addr, p.to_vec());
+                    e.tx.send(from, p.to_vec());
                     // Flush packets queued while the handshake was pending.
                     while let TunnResult::WriteToNetwork(p) = tunn.decapsulate(None, &[], &mut buf)
                     {
-                        e.tx.send(dg.addr, p.to_vec());
+                        e.tx.send(from, p.to_vec());
                     }
                     None
                 }
@@ -357,7 +357,7 @@ async fn net_loop<T: TunDevice>(e: Arc<Engine<T>>, mut rx: mpsc::Receiver<Datagr
                 }
                 // A decrypted keepalive.
                 TunnResult::Done => {
-                    authenticated = dg.data.first() == Some(&MSG_DATA);
+                    authenticated = data.first() == Some(&MSG_DATA);
                     None
                 }
                 TunnResult::Err(err) => {
@@ -369,7 +369,7 @@ async fn net_loop<T: TunDevice>(e: Arc<Engine<T>>, mut rx: mpsc::Receiver<Datagr
 
             // WireGuard roaming: follow the peer to wherever authenticated packets come from.
             if authenticated {
-                *peer.endpoint.lock().unwrap() = dg.addr;
+                *peer.endpoint.lock().unwrap() = from;
             }
             deliver
         };

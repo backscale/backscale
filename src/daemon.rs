@@ -20,8 +20,8 @@ use crate::identity::{KeySpec, PublicKey, Signer};
 use crate::manifest::{NetworkManifest, SignedManifest};
 use crate::net::dht::{Dht, DhtConfig};
 use crate::net::socket::{Endpoint, UdpMux};
-use crate::net::utp::{UtpConfig, UtpSocket};
 use crate::wg::{self, PeerConfig, WgEngine};
+use backscale_utp::{UtpConfig, UtpSocket};
 
 type Engine = WgEngine<tun_rs::AsyncDevice>;
 

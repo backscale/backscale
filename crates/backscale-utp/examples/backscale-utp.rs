@@ -3,15 +3,30 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use rootcause::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
-use backscale::net::socket::UdpMux;
-use backscale::net::utp::{UtpConfig, UtpSocket, UtpStream};
+use backscale_utp::{Transport, UtpConfig, UtpSocket, UtpStream};
+
+async fn socket(bind: SocketAddr) -> Result<(UtpSocket, SocketAddr), Report> {
+    let udp = Arc::new(
+        UdpSocket::bind(bind)
+            .await
+            .context("failed to bind UDP socket")
+            .attach(format!("address: {bind}"))?,
+    );
+    let local = udp.local_addr()?;
+    let (transport, task) = Transport::udp(udp);
+    // The pump lives as long as the process.
+    std::mem::forget(task);
+    Ok((UtpSocket::new(transport, UtpConfig::default()), local))
+}
 
 #[derive(Parser)]
 #[command(name = "backscale-utp", version, about = "uTP transfer test tool")]
@@ -64,9 +79,8 @@ fn main() -> ExitCode {
 }
 
 async fn listen(bind: SocketAddr, once: bool) -> Result<(), Report> {
-    let mux = UdpMux::bind(bind).await?;
-    info!(addr = %mux.local_addr, "listening");
-    let sock = UtpSocket::new(mux.utp, UtpConfig::default());
+    let (sock, local) = socket(bind).await?;
+    info!(addr = %local, "listening");
     loop {
         let s = sock.accept().await?;
         let task = tokio::spawn(receive(s));
@@ -115,8 +129,7 @@ async fn receive(mut s: UtpStream) {
 }
 
 async fn send(to: SocketAddr, bind: SocketAddr, bytes: u64) -> Result<(), Report> {
-    let mux = UdpMux::bind(bind).await?;
-    let sock = UtpSocket::new(mux.utp, UtpConfig::default());
+    let (sock, _) = socket(bind).await?;
     let start = Instant::now();
     let mut s = sock.connect(to).await?;
     info!(%to, "connected in {:?}", start.elapsed());

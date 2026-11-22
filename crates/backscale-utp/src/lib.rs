@@ -1,3 +1,8 @@
+//! uTP (BEP 29) over any datagram transport: a plain UDP socket via
+//! [`Transport::udp`], or one protocol's share of a multiplexed socket.
+
+#![forbid(unsafe_code)]
+
 pub mod conn;
 pub mod ledbat;
 pub mod packet;
@@ -5,13 +10,13 @@ pub mod rtt;
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use rootcause::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::trace;
@@ -19,10 +24,75 @@ use tracing::trace;
 pub use self::conn::UtpError;
 use self::conn::{Role, Setup};
 use self::packet::{Packet, Type};
-use crate::net::socket::{Datagram, Endpoint, PacketTx};
 
 const STREAM_BUFFER: usize = 256 * 1024;
 const INBOX: usize = 1024;
+const UDP_QUEUE: usize = 1024;
+
+pub type Datagram = (SocketAddr, Vec<u8>);
+
+/// Where uTP packets come from and go to. Senders never block: a full queue
+/// drops the packet, as a congested link would.
+pub struct Transport {
+    pub rx: mpsc::Receiver<Datagram>,
+    pub tx: mpsc::Sender<Datagram>,
+}
+
+impl Transport {
+    /// A transport owning `socket` exclusively.
+    pub fn udp(socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
+        let (in_tx, rx) = mpsc::channel(UDP_QUEUE);
+        let (tx, mut out_rx) = mpsc::channel::<Datagram>(UDP_QUEUE);
+        let task = tokio::spawn(async move {
+            let v6 = socket.local_addr().is_ok_and(|a| a.is_ipv6());
+            let recv = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    let _ = in_tx.try_send((canonical(from), buf[..n].to_vec()));
+                }
+            };
+            let send = async {
+                while let Some((to, data)) = out_rx.recv().await {
+                    let to = if v6 { mapped(to) } else { to };
+                    let _ = socket.send_to(&data, to).await;
+                }
+            };
+            tokio::join!(recv, send);
+        });
+        (Transport { rx, tx }, task)
+    }
+}
+
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), addr.port()),
+            None => addr,
+        },
+        IpAddr::V4(_) => addr,
+    }
+}
+
+fn mapped(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(v4) => SocketAddr::new(v4.to_ipv6_mapped().into(), addr.port()),
+        IpAddr::V6(_) => addr,
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PacketTx(mpsc::Sender<Datagram>);
+
+impl PacketTx {
+    pub(crate) fn send(&self, addr: SocketAddr, data: Vec<u8>) {
+        if self.0.try_send((addr, data)).is_err() {
+            trace!(%addr, "outgoing queue full, dropping packet");
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct UtpConfig {
@@ -70,15 +140,15 @@ impl Drop for UtpSocket {
 }
 
 impl UtpSocket {
-    pub fn new(endpoint: Endpoint, config: UtpConfig) -> Self {
+    pub fn new(transport: Transport, config: UtpConfig) -> Self {
         let (accept_tx, accept_rx) = mpsc::channel(config.accept_backlog);
         let shared = Arc::new(Shared {
-            tx: endpoint.tx,
+            tx: PacketTx(transport.tx),
             config,
             conns: Mutex::new(HashMap::new()),
             accept_tx,
         });
-        let task = tokio::spawn(recv_loop(shared.clone(), endpoint.rx));
+        let task = tokio::spawn(recv_loop(shared.clone(), transport.rx));
         UtpSocket {
             shared,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
@@ -86,11 +156,11 @@ impl UtpSocket {
         }
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> Result<UtpStream, Report<UtpError>> {
+    pub async fn connect(&self, addr: SocketAddr) -> Result<UtpStream, UtpError> {
         let recv_id = {
             let conns = self.shared.conns.lock().unwrap();
             if conns.len() >= self.shared.config.max_conns {
-                return Err(report!(UtpError::TooManyConnections));
+                return Err(UtpError::TooManyConnections);
             }
             loop {
                 let id: u16 = rand::random();
@@ -109,18 +179,18 @@ impl UtpSocket {
         );
         match rx.await {
             Ok(Ok(())) => Ok(stream),
-            Ok(Err(e)) => Err(report!(e).attach(format!("peer: {addr}"))),
-            Err(_) => Err(report!(UtpError::SocketClosed)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(UtpError::SocketClosed),
         }
     }
 
-    pub async fn accept(&self) -> Result<UtpStream, Report<UtpError>> {
+    pub async fn accept(&self) -> Result<UtpStream, UtpError> {
         self.accept_rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or_else(|| report!(UtpError::SocketClosed))
+            .ok_or(UtpError::SocketClosed)
     }
 }
 
@@ -166,20 +236,21 @@ fn spawn_conn(
 }
 
 async fn recv_loop(shared: Arc<Shared>, mut rx: mpsc::Receiver<Datagram>) {
-    while let Some(dg) = rx.recv().await {
-        let p = match Packet::decode(&dg.data) {
+    while let Some((addr, data)) = rx.recv().await {
+        let p = match Packet::decode(&data) {
             Ok(p) => p,
             Err(e) => {
-                trace!(addr = %dg.addr, error = %e, "dropping malformed uTP packet");
+                trace!(%addr, error = %e, "dropping malformed uTP packet");
                 continue;
             }
         };
-        dispatch(&shared, dg.addr, p);
+        dispatch(&shared, addr, p);
     }
 }
 
 // A connection uses `id` and `id + 1`. Neither may be 0: an ST_DATA with
-// connection id 0 is indistinguishable from a WireGuard handshake initiation.
+// connection id 0 is indistinguishable from a WireGuard handshake initiation,
+// which a multiplexed socket shared with WireGuard relies on.
 fn valid_id_pair(id: u16) -> bool {
     id != 0 && id != u16::MAX
 }
