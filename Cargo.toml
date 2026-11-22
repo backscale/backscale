@@ -11,12 +11,10 @@ backscale-dht = { path = "crates/backscale-dht" }
 backscale-utp = { path = "crates/backscale-utp" }
 blake3 = { version = "1.8.7", features = ["pure"] }
 boringtun = { version = "0.7.1", default-features = false }
-bt_bencode = "0.8.2"
 card-backend = { version = "0.2", optional = true }
 card-backend-pcsc = { version = "0.5", optional = true }
 clap = { version = "4.6.8", features = ["derive", "env"] }
 const-oid = { version = "0.9", optional = true }
-crc32c = "0.6.9"
 der = { version = "0.7", optional = true }
 ed25519-dalek = "3.0.0"
 hex = "0.4.3"
@@ -31,8 +29,6 @@ rand = "0.10.4"
 rootcause = "0.13"
 rpassword = "7.5.5"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_bytes = "0.11.19"
-sha1 = "0.11.0"
 sha2 = "0.11"
 # Not the defaults: snow's `std` feature pulls in ring.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
