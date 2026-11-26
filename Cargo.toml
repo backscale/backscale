@@ -9,6 +9,7 @@ license = "MIT"
 atomic-write-file = "0.3.1"
 backscale-dht = { path = "crates/backscale-dht" }
 backscale-utp = { path = "crates/backscale-utp" }
+base64ct = { version = "1.8.3", features = ["alloc"] }
 blake3 = { version = "1.8.7", features = ["pure"] }
 boringtun = { version = "0.7.1", default-features = false }
 card-backend = { version = "0.2", optional = true }
@@ -33,6 +34,7 @@ sha2 = "0.11"
 # Not the defaults: snow's `std` feature pulls in ring.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 socket2 = { version = "0.6.5", features = ["all"] }
+subtle = "2.6.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
 toml = "1.2.1"
 tracing = "0.1.44"
