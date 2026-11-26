@@ -10,16 +10,16 @@ use backscale_utp::UtpConfig;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
 }
 
-struct Node {
-    control: ControlNode,
-    addr: SocketAddr,
+pub(crate) struct Node {
+    pub control: ControlNode,
+    pub addr: SocketAddr,
     _tasks: MuxTasks,
 }
 
@@ -51,15 +51,16 @@ async fn node(
     }
 }
 
-struct Net {
-    key: SoftSigner,
-    draft: ManifestDraft,
-    manager: Node,
-    mgr: Arc<Manager>,
+// A one-member network whose only member manages enrollment.
+pub(crate) struct Net {
+    pub key: SoftSigner,
+    pub draft: ManifestDraft,
+    pub manager: Node,
+    pub mgr: Arc<Manager>,
 }
 
 impl Net {
-    fn publish(&mut self) {
+    pub fn publish(&mut self) {
         let signed = self
             .draft
             .next_manifest(now(), 3600)
@@ -69,7 +70,7 @@ impl Net {
     }
 }
 
-async fn network() -> Net {
+pub(crate) async fn network() -> Net {
     let key = SoftSigner::generate();
     let me = SoftSigner::generate();
     let mut draft = ManifestDraft::new(key.public_key(), "net".into()).unwrap();
@@ -88,7 +89,7 @@ async fn network() -> Net {
     net
 }
 
-fn invite(net: &Net, code: &InviteCode) {
+pub(crate) fn invite(net: &Net, code: &InviteCode) {
     net.mgr
         .add_invite(Invite {
             id: code.id(),
@@ -151,7 +152,7 @@ async fn enrollment_within(
     .ok()
 }
 
-async fn until(what: &str, f: impl Fn() -> bool) {
+pub(crate) async fn until(what: &str, f: impl Fn() -> bool) {
     tokio::time::timeout(WAIT, async {
         while !f() {
             tokio::time::sleep(Duration::from_millis(20)).await;

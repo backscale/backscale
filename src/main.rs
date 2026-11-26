@@ -13,6 +13,7 @@ use backscale::config::{Config, StateDir};
 use backscale::daemon::{self, Request, Response, Status};
 use backscale::identity::soft::SoftSigner;
 use backscale::identity::{KeySpec, PublicKey, Signer};
+use backscale::invite::InviteCode;
 use backscale::manifest::{ManifestDraft, NetworkManifest, Selector, SignedManifest};
 
 mod card;
@@ -31,11 +32,24 @@ enum Command {
     /// Create a state directory and identity for joining a network.
     Join {
         /// The network public key (`ed25519:<hex>`) to pin.
-        #[arg(required_unless_present = "card", conflicts_with = "card")]
+        #[arg(required_unless_present_any = ["card", "invite"], conflicts_with_all = ["card", "invite"])]
         network_key: Option<PublicKey>,
         /// Join using the enrollment stored on a YubiKey (PIV slot, default 82).
-        #[arg(long, num_args = 0..=1, default_missing_value = "82", value_name = "SLOT")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "82", value_name = "SLOT", conflicts_with = "invite")]
         card: Option<String>,
+        /// Enroll with an invite code from the network's dashboard and wait
+        /// until the admin (or the invite) approves this node.
+        #[arg(long, env = "BACKSCALE_INVITE", hide_env_values = true)]
+        invite: Option<InviteCode>,
+        /// Name to propose for this node (the invite or the admin may override it).
+        #[arg(long, requires = "invite")]
+        name: Option<String>,
+        /// Identity key spec instead of a new software key, e.g. `piv:82`.
+        #[arg(long, requires = "invite")]
+        identity: Option<String>,
+        /// How long to wait for approval.
+        #[arg(long, default_value = "15m", value_parser = humantime::parse_duration, requires = "invite")]
+        wait: Duration,
         #[arg(long, env = "BACKSCALE_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// `[::]` listens on both IPv4 and IPv6.
@@ -321,14 +335,34 @@ fn run(cli: Cli) -> Result<(), Report> {
         Command::Join {
             network_key,
             card,
+            invite,
+            name,
+            identity,
+            wait,
             state_dir,
             listen,
             peers,
             no_dht,
-        } => match (card, network_key) {
-            (Some(slot), _) => card::join(&slot, StateDir(state_dir), listen, peers, !no_dht),
-            (None, Some(key)) => join(key, StateDir(state_dir), listen, peers, !no_dht),
-            (None, None) => bail!("pass a network key or --card"),
+        } => match (card, invite, network_key) {
+            (Some(slot), _, _) => card::join(&slot, StateDir(state_dir), listen, peers, !no_dht),
+            (None, Some(invite), _) => {
+                let me = runtime()?.block_on(backscale::join::join(backscale::join::JoinArgs {
+                    invite,
+                    name,
+                    identity,
+                    dir: StateDir(state_dir),
+                    listen,
+                    peers,
+                    dht: !no_dht,
+                    lan: true,
+                    wait,
+                }))?;
+                println!("joined as {} ({}, {})", me.name, me.ipv4, me.ipv6);
+                println!("start the daemon with `backscale up`");
+                Ok(())
+            }
+            (None, None, Some(key)) => join(key, StateDir(state_dir), listen, peers, !no_dht),
+            (None, None, None) => bail!("pass a network key, --invite or --card"),
         },
         Command::Enroll {
             piv,

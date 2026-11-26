@@ -370,7 +370,7 @@ fn save_dht_nodes(d: &Daemon, dht: &Dht) {
     }
 }
 
-fn load_or_create_keys(dir: &StateDir) -> Result<SessionKeys, Report> {
+pub fn load_or_create_keys(dir: &StateDir) -> Result<SessionKeys, Report> {
     let path = dir.session_keys();
     if path.exists() {
         return SessionKeys::load(&path);
