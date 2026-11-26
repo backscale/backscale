@@ -17,7 +17,10 @@ use crate::config::{Config, StateDir};
 use crate::control::{ControlConfig, ControlEvent, ControlNode, PeerInfo};
 use crate::discovery::{self, PeerCache};
 use crate::identity::{KeySpec, PublicKey, Signer};
+use crate::invite::InviteId;
+use crate::manager::{Invite, InviteInfo, Manager, Pending};
 use crate::manifest::{NetworkManifest, SignedManifest};
+use crate::net::lan::{self, LanRole};
 use crate::net::socket::{Endpoint, UdpMux};
 use crate::wg::{self, PeerConfig, WgEngine};
 use backscale_dht::{Dht, DhtConfig};
@@ -30,10 +33,15 @@ const DHT_ANNOUNCE_EVERY: Duration = Duration::from_secs(5 * 60);
 const LAN_RETRY: Duration = Duration::from_secs(5 * 60);
 const MAX_REQUEST: usize = 4 << 20;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Request {
     Status,
     Publish(SignedManifest),
+    AddInvite(Invite),
+    ListInvites,
+    RevokeInvite(InviteId),
+    Enrollments,
+    Deny { req_id: u64, reason: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +49,16 @@ pub enum Response {
     Status(Box<Status>),
     Published(u64),
     Error(String),
+    Ok,
+    Invites(Vec<InviteInfo>),
+    Enrollments(Vec<Pending>),
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,10 +130,13 @@ pub async fn run(dir: StateDir) -> Result<(), Report> {
     let mux = UdpMux::bind(config.listen).await?;
     let local = mux.local_addr;
     let utp = Arc::new(UtpSocket::new(mux.utp, UtpConfig::default()));
+    let manager = Arc::new(Manager::load(Some(dir.invites()))?);
     let control = ControlNode::new(
         ControlConfig {
             network_key: config.network_key.clone(),
             manifest_path: Some(dir.manifest()),
+            manager: Some(manager),
+            enroll: None,
         },
         identity.as_ref(),
         load_or_create_keys(&dir)?,
@@ -165,9 +186,12 @@ pub async fn run(dir: StateDir) -> Result<(), Report> {
     tokio::spawn(serve_control(listener, daemon.clone()));
     let (lan_tx, lan_rx) = tokio::sync::mpsc::channel(64);
     if config.lan_discovery {
-        tokio::spawn(crate::net::lan::run(
+        let mgr = daemon.control.manager().cloned();
+        let live = mgr.map(|m| Box::new(move || m.has_live_invites(unix_now())) as Box<_>);
+        tokio::spawn(lan::run(
             daemon.control.net_id(),
             local.port(),
+            LanRole::member(live),
             lan_tx,
         ));
     }
@@ -310,7 +334,11 @@ async fn dataplane(d: &Daemon, endpoint: Endpoint) -> Result<(), Report> {
                 reconcile(&engine, &d.control);
             }
             // The tunnel outlives the control session; membership is what counts.
-            Ok(ControlEvent::PeerDown(_) | ControlEvent::Advertised(_)) => {}
+            Ok(
+                ControlEvent::PeerDown(_)
+                | ControlEvent::Advertised(_)
+                | ControlEvent::Enrollment { .. },
+            ) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => reconcile(&engine, &d.control),
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
@@ -376,6 +404,7 @@ async fn track_events(d: Arc<Daemon>) {
             }
             ControlEvent::PeerDown(id) => info!(peer = %id.fingerprint(), "peer down"),
             ControlEvent::ManifestUpdated { seq, .. } => info!(seq, "manifest updated"),
+            ControlEvent::Enrollment { .. } => {}
             ControlEvent::Advertised(ad) => {
                 let member = d
                     .control
@@ -454,6 +483,7 @@ async fn discovery(
 
     let mut bootstrapped = false;
     let mut last_announce: Option<Instant> = None;
+    let mut last_manager_announce: Option<Instant> = None;
     // Peers re-announce every 30s, also when already connected over another address.
     let mut lan_tried: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(DISCOVERY_TICK);
@@ -507,6 +537,18 @@ async fn discovery(
                     continue;
                 }
             }
+        }
+        let manager_live = d
+            .control
+            .manager()
+            .is_some_and(|m| m.has_live_invites(unix_now()));
+        if !manager_live {
+            last_manager_announce = None;
+        } else if last_manager_announce.is_none_or(|t| t.elapsed() >= DHT_ANNOUNCE_EVERY) {
+            last_manager_announce = Some(Instant::now());
+            let topic = crate::net::manager_topic(&d.control.net_id(), unix_now());
+            let announced = dht.announce(topic, d.local.port(), true).await;
+            debug!(stored = announced.stored, "announced the manager topic");
         }
         if last_announce.is_some_and(|t| t.elapsed() < DHT_ANNOUNCE_EVERY) {
             continue;
@@ -627,7 +669,38 @@ fn handle(d: &Daemon, req: Request) -> Response {
             Ok(seq) => Response::Published(seq),
             Err(e) => Response::Error(e.to_string()),
         },
+        req => manager_request(&d.control, req).unwrap_or_else(|e| Response::Error(e.to_string())),
     }
+}
+
+fn manager_request(control: &ControlNode, req: Request) -> Result<Response, Report> {
+    let mgr = control
+        .manager()
+        .ok_or_else(|| report!("this daemon is not a manager"))?;
+    let now = unix_now();
+    Ok(match req {
+        Request::AddInvite(invite) => {
+            if invite.expires_at <= now {
+                bail!("invite is already expired");
+            }
+            mgr.add_invite(invite)?;
+            Response::Ok
+        }
+        Request::ListInvites => Response::Invites(mgr.invites(now)),
+        Request::RevokeInvite(id) => {
+            for session in mgr.revoke_invite(&id)? {
+                control.close_session(session, "invite revoked");
+            }
+            Response::Ok
+        }
+        Request::Enrollments => Response::Enrollments(mgr.pending(now)),
+        Request::Deny { req_id, reason } => {
+            let (identity, session, psk) = mgr.deny(req_id, reason.clone())?;
+            control.deny_enrollment(session, &identity, &psk, reason);
+            Response::Ok
+        }
+        Request::Status | Request::Publish(_) => bail!("not a manager request"),
+    })
 }
 
 async fn read_frame<T: serde::de::DeserializeOwned>(s: &mut UnixStream) -> Result<T, Report> {

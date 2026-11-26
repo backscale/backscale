@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use crate::manifest::NetId;
-use crate::net::{TOPIC_PERIOD_SECS, topic};
+use crate::net::{TOPIC_PERIOD_SECS, manager_topic, topic};
 
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 41, 64);
 pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xbac5);
@@ -31,10 +31,31 @@ fn now() -> u64 {
         .as_secs()
 }
 
-pub fn encode(net_id: &NetId, unix: u64, port: u16, iface: Option<Ipv4Addr>) -> [u8; PACKET_LEN] {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Topic {
+    Member,
+    Manager,
+}
+
+impl Topic {
+    fn of(self, net_id: &NetId, unix: u64) -> [u8; 20] {
+        match self {
+            Topic::Member => topic(net_id, unix).0,
+            Topic::Manager => manager_topic(net_id, unix).0,
+        }
+    }
+}
+
+pub fn encode(
+    kind: Topic,
+    net_id: &NetId,
+    unix: u64,
+    port: u16,
+    iface: Option<Ipv4Addr>,
+) -> [u8; PACKET_LEN] {
     let mut p = [0u8; PACKET_LEN];
     p[..6].copy_from_slice(MAGIC);
-    p[6..26].copy_from_slice(&topic(net_id, unix).0);
+    p[6..26].copy_from_slice(&kind.of(net_id, unix));
     p[26..28].copy_from_slice(&port.to_be_bytes());
     p[28..].copy_from_slice(&iface.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
     p
@@ -42,13 +63,13 @@ pub fn encode(net_id: &NetId, unix: u64, port: u16, iface: Option<Ipv4Addr>) -> 
 
 // The announced port and interface address if the packet is for our network,
 // allowing the previous topic period for rollover and clock skew.
-pub fn decode(net_id: &NetId, unix: u64, p: &[u8]) -> Option<(u16, Option<Ipv4Addr>)> {
+pub fn decode(kind: Topic, net_id: &NetId, unix: u64, p: &[u8]) -> Option<(u16, Option<Ipv4Addr>)> {
     if p.len() != PACKET_LEN || &p[..6] != MAGIC {
         return None;
     }
-    let current = topic(net_id, unix);
-    let previous = topic(net_id, unix.saturating_sub(TOPIC_PERIOD_SECS));
-    if p[6..26] != current.0 && p[6..26] != previous.0 {
+    let current = kind.of(net_id, unix);
+    let previous = kind.of(net_id, unix.saturating_sub(TOPIC_PERIOD_SECS));
+    if p[6..26] != current && p[6..26] != previous {
         return None;
     }
     let port = u16::from_be_bytes([p[26], p[27]]);
@@ -101,7 +122,7 @@ fn bind(domain: Domain) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(s.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Iface {
     V4(Ipv4Addr),
     V6(u32),
@@ -151,27 +172,41 @@ impl Lan {
                     continue;
                 }
             }
-            self.joined.insert(iface.clone());
+            self.joined.insert(*iface);
         }
         self.joined.retain(|i| now.contains(i));
         now
     }
 
-    async fn announce(&mut self, net_id: &NetId, port: u16) {
+    async fn announce(&mut self, kinds: &[Topic], net_id: &NetId, port: u16) {
         let unix = now();
-        for iface in self.refresh() {
+        let ifaces = self.refresh();
+        for kind in kinds {
+            self.announce_one(&ifaces, *kind, net_id, port, unix).await;
+        }
+    }
+
+    async fn announce_one(
+        &self,
+        ifaces: &HashSet<Iface>,
+        kind: Topic,
+        net_id: &NetId,
+        port: u16,
+        unix: u64,
+    ) {
+        for &iface in ifaces {
             let Some(s) = self.sock(&iface) else { continue };
             let sock = socket2::SockRef::from(s);
             let (set, dst, packet): (_, SocketAddr, _) = match iface {
                 Iface::V4(a) => (
                     sock.set_multicast_if_v4(&a),
                     SocketAddrV4::new(GROUP_V4, LAN_PORT).into(),
-                    encode(net_id, unix, port, Some(a)),
+                    encode(kind, net_id, unix, port, Some(a)),
                 ),
                 Iface::V6(i) => (
                     sock.set_multicast_if_v6(i),
                     SocketAddrV6::new(GROUP_V6, LAN_PORT, 0, i).into(),
-                    encode(net_id, unix, port, None),
+                    encode(kind, net_id, unix, port, None),
                 ),
             };
             if let Err(e) = set {
@@ -192,7 +227,43 @@ async fn recv(s: &Option<UdpSocket>, buf: &mut [u8]) -> std::io::Result<(usize, 
     }
 }
 
-pub async fn run(net_id: NetId, port: u16, found: mpsc::Sender<SocketAddr>) {
+pub struct LanRole {
+    pub listen: Topic,
+    pub announce_member: bool,
+    // The manager topic is announced while this says so.
+    pub manager_live: Option<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl LanRole {
+    pub fn member(manager_live: Option<Box<dyn Fn() -> bool + Send>>) -> Self {
+        LanRole {
+            listen: Topic::Member,
+            announce_member: true,
+            manager_live,
+        }
+    }
+
+    pub fn find_manager() -> Self {
+        LanRole {
+            listen: Topic::Manager,
+            announce_member: false,
+            manager_live: None,
+        }
+    }
+
+    fn announcing(&self) -> Vec<Topic> {
+        let mut v = vec![];
+        if self.announce_member {
+            v.push(Topic::Member);
+        }
+        if self.manager_live.as_ref().is_some_and(|f| f()) {
+            v.push(Topic::Manager);
+        }
+        v
+    }
+}
+
+pub async fn run(net_id: NetId, port: u16, role: LanRole, found: mpsc::Sender<SocketAddr>) {
     let v4 = bind(Domain::IPV4)
         .inspect_err(|e| warn!(error = %e, "LAN discovery unavailable over IPv4"))
         .ok();
@@ -213,7 +284,7 @@ pub async fn run(net_id: NetId, port: u16, found: mpsc::Sender<SocketAddr>) {
     loop {
         let (r, data) = tokio::select! {
             _ = tick.tick() => {
-                lan.announce(&net_id, port).await;
+                lan.announce(&role.announcing(), &net_id, port).await;
                 continue;
             }
             r = recv(&lan.v4, &mut buf) => (r, &buf),
@@ -226,7 +297,7 @@ pub async fn run(net_id: NetId, port: u16, found: mpsc::Sender<SocketAddr>) {
                 continue;
             }
         };
-        let Some((peer_port, claimed)) = decode(&net_id, now(), &data[..n]) else {
+        let Some((peer_port, claimed)) = decode(role.listen, &net_id, now(), &data[..n]) else {
             continue;
         };
         let candidate = candidate(src, peer_port, claimed);
@@ -247,20 +318,38 @@ mod tests {
     fn roundtrip_and_rejects() {
         let t = 1_800_000_000;
         let a = Ipv4Addr::new(10, 0, 0, 5);
-        let p = encode(&net(1), t, 41641, Some(a));
-        assert_eq!(decode(&net(1), t, &p), Some((41641, Some(a))));
-        let p6 = encode(&net(1), t, 41641, None);
-        assert_eq!(decode(&net(1), t, &p6), Some((41641, None)));
-        assert_eq!(decode(&net(2), t, &p), None, "other network");
-        assert_eq!(decode(&net(1), t, &p[..31]), None, "short");
+        let p = encode(Topic::Member, &net(1), t, 41641, Some(a));
+        assert_eq!(
+            decode(Topic::Member, &net(1), t, &p),
+            Some((41641, Some(a)))
+        );
+        let p6 = encode(Topic::Member, &net(1), t, 41641, None);
+        assert_eq!(decode(Topic::Member, &net(1), t, &p6), Some((41641, None)));
+        assert_eq!(decode(Topic::Member, &net(2), t, &p), None, "other network");
+        assert_eq!(decode(Topic::Member, &net(1), t, &p[..31]), None, "short");
         let mut bad = p;
         bad[0] ^= 1;
-        assert_eq!(decode(&net(1), t, &bad), None, "magic");
+        assert_eq!(decode(Topic::Member, &net(1), t, &bad), None, "magic");
         assert_eq!(
-            decode(&net(1), t, &encode(&net(1), t, 0, None)),
+            decode(
+                Topic::Member,
+                &net(1),
+                t,
+                &encode(Topic::Member, &net(1), t, 0, None)
+            ),
             None,
             "port 0"
         );
+    }
+
+    #[test]
+    fn manager_beacons_are_separate() {
+        let t = 1_800_000_000;
+        let p = encode(Topic::Manager, &net(1), t, 7, None);
+        assert_eq!(decode(Topic::Manager, &net(1), t, &p), Some((7, None)));
+        assert_eq!(decode(Topic::Member, &net(1), t, &p), None);
+        let m = encode(Topic::Member, &net(1), t, 7, None);
+        assert_eq!(decode(Topic::Manager, &net(1), t, &m), None);
     }
 
     #[test]
@@ -286,19 +375,19 @@ mod tests {
     #[test]
     fn topic_window() {
         let t = 1_800_000_000 - 1_800_000_000 % TOPIC_PERIOD_SECS + 10;
-        let p = encode(&net(1), t, 7, None);
+        let p = encode(Topic::Member, &net(1), t, 7, None);
         assert_eq!(
-            decode(&net(1), t + TOPIC_PERIOD_SECS, &p),
+            decode(Topic::Member, &net(1), t + TOPIC_PERIOD_SECS, &p),
             Some((7, None)),
             "previous period"
         );
         assert_eq!(
-            decode(&net(1), t + 2 * TOPIC_PERIOD_SECS, &p),
+            decode(Topic::Member, &net(1), t + 2 * TOPIC_PERIOD_SECS, &p),
             None,
             "too old"
         );
         assert_eq!(
-            decode(&net(1), t - TOPIC_PERIOD_SECS, &p),
+            decode(Topic::Member, &net(1), t - TOPIC_PERIOD_SECS, &p),
             None,
             "future period"
         );

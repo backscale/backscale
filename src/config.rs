@@ -64,6 +64,10 @@ impl StateDir {
         self.0.join("peers.cache")
     }
 
+    pub fn invites(&self) -> PathBuf {
+        self.0.join("invites")
+    }
+
     pub fn dht_nodes(&self) -> PathBuf {
         self.0.join("dht.nodes")
     }

@@ -19,6 +19,8 @@ use self::noise::Side;
 use crate::binding::{DEFAULT_BINDING_LIFETIME_SECS, DeviceBinding, SessionKeys, SignedBinding};
 use crate::discovery::MAX_ENDPOINTS;
 use crate::identity::{PublicKey, Signer};
+use crate::invite::{self, InviteCode, InviteId};
+use crate::manager::{EnrollState, Manager};
 use crate::manifest::{self, ManifestDiff, ManifestError, NetId, NetworkManifest, SignedManifest};
 use backscale_utp::{UtpSocket, UtpStream};
 
@@ -37,6 +39,8 @@ const DIAL_BACKOFF: Duration = Duration::from_secs(60);
 const PUNCH_DIAL_BACKOFF: Duration = Duration::from_secs(5);
 const PUNCH_RELAY_LIMIT: Duration = Duration::from_secs(10);
 const MAX_ADS: usize = 256;
+// How long one session may wait for an enrollment decision.
+const ENROLL_GRACE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -70,6 +74,23 @@ pub enum Msg {
         from: PublicKey,
         endpoints: Vec<SocketAddr>,
     },
+    // A node holding an invite asks the manager to admit it. The MACs bind
+    // both to this session's handshake hash.
+    Enroll {
+        invite_id: InviteId,
+        name: Option<String>,
+        mac: [u8; 32],
+    },
+    EnrollStatus {
+        mac: [u8; 32],
+        state: EnrollState,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct EnrollAs {
+    pub invite: InviteCode,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,15 +122,27 @@ impl PeerInfo {
 pub enum ControlEvent {
     PeerUp(Box<PeerInfo>),
     PeerDown(PublicKey),
-    ManifestUpdated { seq: u64, diff: Arc<ManifestDiff> },
+    ManifestUpdated {
+        seq: u64,
+        diff: Arc<ManifestDiff>,
+    },
     // A peer told us how to reach another member (unverified until we connect).
     Advertised(PeerAd),
+    // The manager's answer to our enrollment request.
+    Enrollment {
+        manager: SocketAddr,
+        state: EnrollState,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
     pub network_key: PublicKey,
     pub manifest_path: Option<PathBuf>,
+    // Set on the member that answers enrollment requests.
+    pub manager: Option<Arc<Manager>>,
+    // Set on a node that is enrolling.
+    pub enroll: Option<EnrollAs>,
 }
 
 // Orders duplicate sessions to the same peer. Both ends compute the same key
@@ -149,6 +182,8 @@ struct Inner {
     self_addrs: Mutex<HashSet<SocketAddr>>,
     utp: Arc<UtpSocket>,
     manifest_path: Option<PathBuf>,
+    manager: Option<Arc<Manager>>,
+    enroll: Option<EnrollAs>,
     persist: Mutex<()>,
     state: Mutex<State>,
     next_id: AtomicU64,
@@ -214,6 +249,8 @@ impl ControlNode {
                 self_addrs: Mutex::new(HashSet::new()),
                 utp,
                 manifest_path: config.manifest_path,
+                manager: config.manager,
+                enroll: config.enroll,
                 persist: Mutex::new(()),
                 state: Mutex::new(state),
                 next_id: AtomicU64::new(1),
@@ -298,6 +335,32 @@ impl ControlNode {
 
     pub fn publish(&self, signed: SignedManifest) -> Result<u64, Report<ManifestError>> {
         self.inner.adopt(&signed)
+    }
+
+    pub fn manager(&self) -> Option<&Arc<Manager>> {
+        self.inner.manager.as_ref()
+    }
+
+    // Tells an enrolling node on `session` that it was turned down, then
+    // closes the session.
+    pub fn deny_enrollment(&self, session: u64, identity: &PublicKey, psk: &[u8; 32], why: String) {
+        let st = self.inner.state();
+        let Some(s) = st.sessions.get(&session) else {
+            return;
+        };
+        if let Some((_, hash)) = &s.rank {
+            let _ = s.out.try_send(Msg::EnrollStatus {
+                mac: invite::status_mac(psk, hash, identity),
+                state: EnrollState::Denied(why),
+            });
+        }
+        s.close.send_replace(Some("enrollment denied"));
+    }
+
+    pub fn close_session(&self, session: u64, why: &'static str) {
+        if let Some(s) = self.inner.state().sessions.get(&session) {
+            s.close.send_replace(Some(why));
+        }
     }
 
     pub fn start(&self) {
@@ -401,6 +464,9 @@ impl Inner {
             changed = diff.changed.len(),
             "adopted manifest"
         );
+        if let Some(mgr) = &self.manager {
+            mgr.manifest_adopted(&new);
+        }
         state.manifest = Some((new, signed.clone()));
         // Published under the lock so concurrent adopts can't announce out of order.
         self.manifest_seq.send_replace(seq);
@@ -867,6 +933,17 @@ async fn run_session(
     if hello.manifest_seq > inner.seq() && !send(Msg::GetManifest) {
         return Ok(());
     }
+    if let Some(e) = &inner.enroll {
+        let mac = invite::request_mac(&e.invite.psk(), &hash, &inner.identity);
+        let enroll = Msg::Enroll {
+            invite_id: e.invite.id(),
+            name: e.name.clone(),
+            mac,
+        };
+        if !send(enroll) {
+            return Ok(());
+        }
+    }
 
     let mut verified = false;
     let check = |verified: &mut bool| -> Option<&'static str> {
@@ -943,6 +1020,43 @@ async fn run_session(
                         inner.dial(&from, &endpoints, PUNCH_DIAL_BACKOFF, None);
                     }
                     Some(Msg::Peers(_) | Msg::Punch(_) | Msg::PunchRequest { .. }) => {}
+                    Some(Msg::Enroll { invite_id, name, mac }) if !verified => {
+                        let Some(mgr) = &inner.manager else { continue };
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        match hello.binding.verify(&hello.identity, inner.net_id, now) {
+                            Ok(b) if b.noise_public == remote_static => {}
+                            _ => break Some("invalid device binding"),
+                        }
+                        let Some(acc) = mgr.request(&invite_id, &mac, &hash, &hello.identity, name, addr, id, now) else {
+                            continue;
+                        };
+                        let status = Msg::EnrollStatus {
+                            mac: invite::status_mac(&acc.psk, &hash, &hello.identity),
+                            state: acc.state.clone(),
+                        };
+                        if !send(status) {
+                            break Some("peer too slow");
+                        }
+                        match acc.state {
+                            EnrollState::Pending => {
+                                let left = Duration::from_secs(acc.until.saturating_sub(now)).min(ENROLL_GRACE);
+                                grace.as_mut().reset(Instant::now() + left);
+                            }
+                            EnrollState::Denied(_) => break Some("enrollment denied"),
+                        }
+                    }
+                    Some(Msg::Enroll { .. }) => {}
+                    Some(Msg::EnrollStatus { mac, state }) => {
+                        let Some(e) = &inner.enroll else { continue };
+                        if !invite::mac_eq(&mac, &invite::status_mac(&e.invite.psk(), &hash, &inner.identity)) {
+                            break Some("not the network manager");
+                        }
+                        let _ = inner.events.send(ControlEvent::Enrollment { manager: addr, state: state.clone() });
+                        match state {
+                            EnrollState::Pending => grace.as_mut().reset(Instant::now() + ENROLL_GRACE),
+                            EnrollState::Denied(_) => break Some("enrollment denied"),
+                        }
+                    }
                     Some(Msg::Hello(_)) => break Some("unexpected Hello"),
                     Some(Msg::Bye(reason)) => {
                         debug!(%reason, "peer said bye");
@@ -997,3 +1111,6 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+#[cfg(test)]
+mod tests;
