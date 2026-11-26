@@ -42,6 +42,7 @@ pub enum Request {
     RevokeInvite(InviteId),
     Enrollments,
     Deny { req_id: u64, reason: String },
+    Manifest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +53,7 @@ pub enum Response {
     Ok,
     Invites(Vec<InviteInfo>),
     Enrollments(Vec<Pending>),
+    Manifest(Option<SignedManifest>),
 }
 
 fn unix_now() -> u64 {
@@ -669,6 +671,7 @@ fn handle(d: &Daemon, req: Request) -> Response {
             Ok(seq) => Response::Published(seq),
             Err(e) => Response::Error(e.to_string()),
         },
+        Request::Manifest => Response::Manifest(d.control.signed_manifest()),
         req => manager_request(&d.control, req).unwrap_or_else(|e| Response::Error(e.to_string())),
     }
 }
@@ -699,7 +702,9 @@ fn manager_request(control: &ControlNode, req: Request) -> Result<Response, Repo
             control.deny_enrollment(session, &identity, &psk, reason);
             Response::Ok
         }
-        Request::Status | Request::Publish(_) => bail!("not a manager request"),
+        Request::Status | Request::Publish(_) | Request::Manifest => {
+            bail!("not a manager request")
+        }
     })
 }
 

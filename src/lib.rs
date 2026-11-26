@@ -4,6 +4,7 @@ pub mod binding;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod dashboard;
 pub mod discovery;
 pub mod enroll;
 pub mod identity;

@@ -337,6 +337,10 @@ impl ControlNode {
         self.inner.adopt(&signed)
     }
 
+    pub fn signed_manifest(&self) -> Option<SignedManifest> {
+        self.inner.signed_manifest()
+    }
+
     pub fn manager(&self) -> Option<&Arc<Manager>> {
         self.inner.manager.as_ref()
     }

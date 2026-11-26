@@ -1,0 +1,37 @@
+:root {
+  --bg: #f6f7f9; --fg: #1d2330; --muted: #6b7385; --card: #fff; --line: #dde1e8;
+  --accent: #2557d6; --danger: #b42318; --ok: #1a7f37;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --fg: #e3e7ee; --muted: #8b93a5; --card: #1a1f27; --line: #2b323d;
+    --accent: #6d95ff; --danger: #ff6b5e; --ok: #4ccf74;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+header { display: flex; gap: 1rem; align-items: baseline; padding: .8rem 1.2rem; border-bottom: 1px solid var(--line); background: var(--card); }
+header h1 { font-size: 1.1rem; margin: 0; }
+header button { margin-left: auto; }
+main { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+main.login { max-width: 380px; margin-top: 12vh; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .8rem 1rem; margin-bottom: 1rem; }
+h2 { font-size: 1rem; margin: 0 0 .6rem; }
+table { border-collapse: collapse; width: 100%; margin-bottom: .6rem; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; margin: 0 0 .6rem; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+form { display: inline-flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: .2rem 0; }
+input { font: inherit; padding: .25rem .4rem; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); }
+button { font: inherit; padding: .25rem .7rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: #fff; cursor: pointer; }
+button.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+code, pre { font-family: ui-monospace, monospace; font-size: .92em; }
+pre { white-space: pre-wrap; word-break: break-all; background: var(--bg); padding: .6rem; border-radius: 4px; }
+.card { border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; margin-bottom: .5rem; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); }
+.err { color: var(--danger); }
+.login form { display: flex; flex-direction: column; align-items: stretch; }
+.login label { display: flex; flex-direction: column; gap: .3rem; }

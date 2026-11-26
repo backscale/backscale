@@ -113,6 +113,22 @@ enum Command {
     /// Administer a network (manifest draft, signing).
     #[command(subcommand)]
     Net(NetCmd),
+    /// Serve the network dashboard on a loopback address. Talks to the local
+    /// daemon, signs with the network key, and prints the login token.
+    Dashboard {
+        /// Network key spec that signs the manifest.
+        #[arg(long)]
+        network_key: KeySpec,
+        #[arg(long, default_value = "net.toml")]
+        draft: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:41700")]
+        listen: SocketAddr,
+        /// How long manifests signed from the dashboard stay valid.
+        #[arg(long, default_value = "30d", value_parser = humantime::parse_duration)]
+        validity: Duration,
+        #[arg(long, env = "BACKSCALE_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -401,6 +417,26 @@ fn run(cli: Cli) -> Result<(), Report> {
         }
         Command::Key(cmd) => key_cmd(cmd),
         Command::Net(cmd) => net_cmd(cmd),
+        Command::Dashboard {
+            network_key,
+            draft,
+            listen,
+            validity,
+            state_dir,
+        } => {
+            let signer = network_key
+                .open()
+                .context("failed to open the network key")?;
+            runtime()?.block_on(backscale::dashboard::run(
+                backscale::dashboard::DashboardArgs {
+                    signer: std::sync::Arc::from(signer),
+                    draft,
+                    listen,
+                    state_dir: StateDir(state_dir),
+                    validity,
+                },
+            ))
+        }
     }
 }
 
